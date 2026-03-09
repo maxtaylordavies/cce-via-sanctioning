@@ -26,6 +26,11 @@ MAX_EXPANSION_LEN = max(
     ]
 )
 MAX_RULE_LEN = MAX_EXPANSION_LEN
+MAX_PLANT_LEN = 20
+MAX_RECIPE_LEN = 10
+MAX_LIBRARY_SIZE = 5
+
+GOAL_PLANT = jnp.zeros(MAX_PLANT_LEN, dtype=jnp.int32).at[0].set(N)
 
 _rule_lengths = []
 _rule_tokens = []
@@ -51,23 +56,40 @@ HAS_REVERSE_RULES = jnp.array(
 )
 
 
-@partial(jax.jit, static_argnames=["complexity_level", "max_length"])
-def generate_plant(key, complexity_level, max_length=20):
-    plant = jnp.zeros(max_length, dtype=jnp.int32).at[0].set(N)  # Start with just N
+# construct initial recipe library from atomic forward rules
+initial_library = jnp.zeros(
+    (MAX_LIBRARY_SIZE, MAX_RECIPE_LEN, 2, MAX_RULE_LEN), dtype=jnp.int32
+)
+zeros, counter = jnp.zeros(MAX_RULE_LEN, dtype=jnp.int32), 0
+for k, vs in REVERSE_RULES.items():
+    rule_result = zeros.at[0].set(k)
+    for v in vs:
+        rule_target = zeros.at[: len(v)].set(v)
+        recipe = jnp.stack([jnp.stack([rule_target, rule_result], axis=0)], axis=0)
+        recipe = jnp.pad(
+            recipe, ((0, MAX_RECIPE_LEN - 1), (0, 0), (0, 0)), constant_values=PAD
+        )
+        initial_library = initial_library.at[counter].set(recipe)
+        counter += 1
+
+
+@partial(jax.jit, static_argnames=["complexity_level"])
+def generate_plant(key, complexity_level):
+    plant = jnp.zeros(MAX_PLANT_LEN, dtype=jnp.int32).at[0].set(N)  # Start with just N
     actual_length = 1  # Track the actual length of the plant sans padding
 
     def body_fn(carry, _):
         key, plant, actual_length = carry
         key, idx_key, rule_key = jax.random.split(key, 3)
 
-        p_idx = jnp.zeros(max_length, dtype=jnp.float32)
-        for i in range(max_length):
+        p_idx = jnp.zeros(MAX_PLANT_LEN, dtype=jnp.float32)
+        for i in range(MAX_PLANT_LEN):
             p_idx = p_idx.at[i].set(HAS_REVERSE_RULES[plant[i]])
         stop = jnp.sum(p_idx) == 0
         p_idx = jnp.where(stop, jnp.ones_like(p_idx), p_idx)
         p_idx /= p_idx.sum()
 
-        target_idx = jax.random.choice(idx_key, max_length, p=p_idx)
+        target_idx = jax.random.choice(idx_key, MAX_PLANT_LEN, p=p_idx)
         target_token = plant[target_idx]
 
         token_rule_lengths = RULE_LENGTHS[target_token]
@@ -80,7 +102,7 @@ def generate_plant(key, complexity_level, max_length=20):
         expansion_len = token_rule_lengths[rule_idx]
 
         # Apply the expansion (replace one token with a variable-length expansion)
-        new_positions = jnp.arange(max_length, dtype=jnp.int32)
+        new_positions = jnp.arange(MAX_PLANT_LEN, dtype=jnp.int32)
 
         # Prefix positions copy directly from the original plant.
         src_prefix = new_positions
@@ -97,7 +119,7 @@ def generate_plant(key, complexity_level, max_length=20):
         )
 
         src_idx = jnp.where(in_prefix, src_prefix, src_tail)
-        src_idx = jnp.clip(src_idx, 0, max_length - 1)
+        src_idx = jnp.clip(src_idx, 0, MAX_PLANT_LEN - 1)
         copied = plant[src_idx]
 
         expansion_idx = jnp.clip(src_expansion, 0, MAX_EXPANSION_LEN - 1)
@@ -107,7 +129,7 @@ def generate_plant(key, complexity_level, max_length=20):
         new_plant: jax.Array = jnp.where(in_expansion, expansion_vals, copied)
 
         actual_length += expansion_len - 1
-        stop: jax.Array = stop | (actual_length >= max_length)
+        stop: jax.Array = stop | (actual_length >= MAX_PLANT_LEN)
         plant: jax.Array = jnp.where(stop, plant, new_plant)
 
         return (key, plant, actual_length), None
@@ -118,22 +140,21 @@ def generate_plant(key, complexity_level, max_length=20):
     return plant
 
 
-def pregenerate_plants(key, num_per_level, max_level, max_length=20):
-    plants = jnp.zeros((max_level, num_per_level, max_length), dtype=jnp.int32)
+def pregenerate_plants(key, num_per_level, max_level):
+    plants = jnp.zeros((max_level, num_per_level, MAX_PLANT_LEN), dtype=jnp.int32)
     for cl in range(max_level):
         key, subkey = jax.random.split(key)
         keys = jax.random.split(subkey, num_per_level)
-        tmp = jax.vmap(lambda k: generate_plant(k, cl, max_length))(keys)
+        tmp = jax.vmap(lambda k: generate_plant(k, cl))(keys)
         plants = plants.at[cl].set(tmp)
     return plants
 
 
-@partial(jax.jit, static_argnames=["max_length"])
+@jax.jit
 def apply_rule(
     plant,
     target,
     replacement,
-    max_length=20,
 ):
     """
     Applies one forward rule to a padded plant token array.
@@ -142,17 +163,17 @@ def apply_rule(
     If no occurrence is found, `plant` is returned unchanged.
 
     Args:
-        plant: jnp.ndarray[int32] shape (max_length,), PAD-terminated.
+        plant: jnp.ndarray[int32] shape (MAX_PLANT_LEN,), PAD-terminated.
         target: jnp.ndarray[int32] shape (MAX_RULE_LEN,), PAD-terminated.
         replacement: jnp.ndarray[int32] shape (max_replacement_len,), PAD-terminated.
-        max_length: Static maximum sequence length.
+        MAX_PLANT_LEN: Static maximum sequence length.
         MAX_RULE_LEN: Static padded length of `target`.
         max_replacement_len: Static padded length of `replacement`.
 
     Returns:
-        jnp.ndarray[int32] shape (max_length,), updated plant.
+        jnp.ndarray[int32] shape (MAX_PLANT_LEN,), updated plant.
     """
-    positions = jnp.arange(max_length, dtype=jnp.int32)
+    positions = jnp.arange(MAX_PLANT_LEN, dtype=jnp.int32)
 
     plant_len = jnp.sum(plant != PAD)
     target_len = jnp.sum(target != PAD)
@@ -164,7 +185,7 @@ def apply_rule(
     # Check substring equality at each candidate start.
     offsets = jnp.arange(MAX_RULE_LEN, dtype=jnp.int32)
     idx_matrix = positions[:, None] + offsets[None, :]
-    safe_idx_matrix = jnp.clip(idx_matrix, 0, max_length - 1)
+    safe_idx_matrix = jnp.clip(idx_matrix, 0, MAX_PLANT_LEN - 1)
     plant_windows = plant[safe_idx_matrix]
 
     active_target_mask = offsets < target_len
@@ -187,7 +208,7 @@ def apply_rule(
 
     src_tail = positions - delta
     src_idx = jnp.where(in_prefix, positions, src_tail)
-    src_idx = jnp.clip(src_idx, 0, max_length - 1)
+    src_idx = jnp.clip(src_idx, 0, MAX_PLANT_LEN - 1)
     copied = plant[src_idx]
 
     repl_idx = jnp.clip(positions - first_match, 0, MAX_RULE_LEN - 1)
@@ -195,28 +216,68 @@ def apply_rule(
 
     updated = jnp.where(in_replacement, repl_vals, copied)
 
-    new_len = jnp.clip(plant_len + delta, 0, max_length)
+    new_len = jnp.clip(plant_len + delta, 0, MAX_PLANT_LEN)
     updated = jnp.where(positions < new_len, updated, PAD)
 
     return jnp.where(has_match, updated, plant)
 
 
-@partial(jax.jit, static_argnames=["max_length"])
-def apply_recipe(plant, recipe, max_length=20):
+@jax.jit
+def apply_recipe(plant, recipe):
     """
     Applies a sequence of rules to a plant.
 
     Args:
-        plant: jnp.ndarray[int32] shape (max_length,), PAD-terminated.
+        plant: jnp.ndarray[int32] shape (MAX_PLANT_LEN,), PAD-terminated.
         recipe: jnp.ndarray[int32] shape (num_rules, 2, MAX_RULE_LEN), where each row is [target, replacement] stacked and PAD-terminated.
-        max_length: Static maximum sequence length.
+        MAX_PLANT_LEN: Static maximum sequence length.
 
     Returns:
-        jnp.ndarray[int32] shape (max_length,), updated plant after applying all rules in the recipe.
+        jnp.ndarray[int32] shape (MAX_PLANT_LEN,), updated plant after applying all rules in the recipe.
     """
 
     def body_fn(plant, rule):
         target, replacement = rule
-        return apply_rule(plant, target, replacement, max_length), None
+        return apply_rule(plant, target, replacement), None
 
     return jax.lax.scan(body_fn, plant, recipe)[0]
+
+
+@jax.jit
+def evaluate_library_on_plant(plant, library, rule_cost=0.1):
+    """
+    Evaluates a library of recipes on a single plant.
+
+    Args:
+        plant: jnp.ndarray[int32] shape (MAX_PLANT_LEN,), PAD-terminated.
+        library: jnp.ndarray[int32] shape (num_recipes, num_rules, 2, MAX_RULE_LEN), where each recipe is a sequence of [target, replacement] stacked and PAD-terminated.
+
+    Returns:
+        jnp.ndarray[float32] shape (), yield from best recipe
+        jnp.ndarray[int32] shape (), index of best recipe
+    """
+    processed = jax.vmap(lambda recipe: apply_recipe(plant, recipe))(library)
+
+    # determine if each processed plant matches the goal plant
+    successes = jnp.all(processed == GOAL_PLANT, axis=1)
+
+    # scale successful yields by original plant complexity (number of non-PAD tokens)
+    complexity = jnp.sum(plant != PAD)
+    yields = successes.astype(jnp.float32) * complexity
+
+    # calculate the actual length of each recipe (number of non-PAD rules)
+    recipe_lengths = jnp.sum(jnp.any(library != PAD, axis=(2, 3)), axis=1)
+    yields -= rule_cost * recipe_lengths  # penalize longer recipes
+
+    yields = jnp.maximum(yields, 0.0)  # ensure yields are non-negative
+    best_idx = jnp.argmax(yields)
+    return yields[best_idx], best_idx
+
+
+key = jax.random.PRNGKey(0)
+plant = generate_plant(key, complexity_level=1)
+print("Generated plant:", plant)
+
+best_yield, best_recipe_idx = evaluate_library_on_plant(plant, initial_library)
+print("Best yield:", best_yield)
+print("Best recipe index:", best_recipe_idx)
