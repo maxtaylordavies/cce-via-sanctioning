@@ -299,7 +299,7 @@ def apply_recipe(plant, recipe):
 
 
 @jax.jit
-def evaluate_library(plants, library, rule_cost=0.2):
+def evaluate_library(plants, library, rule_cost=0.01):
     """
     Evaluates a library of recipes on a batch of plants.
 
@@ -345,6 +345,24 @@ def get_library_size(library):
 @jax.jit
 def get_diff_size(library_1, library_2):
     return (library_2 != library_1).astype(jnp.int32).sum()
+
+
+@jax.jit
+def get_library_entropy(library):
+    num_rules = atomic_rules.shape[0]
+    transition_counts = jnp.zeros((num_rules, num_rules), dtype=jnp.int32)
+    for recipe in library:
+        for i in range(recipe.shape[0] - 1):
+            rule_from = recipe[i]
+            rule_to = recipe[i + 1]
+            transition_counts = transition_counts.at[rule_from, rule_to].add(1)
+
+    # exclude the first row of transition_counts (corresponding to PAD)
+    transition_counts = transition_counts[1:]
+
+    p = transition_counts / transition_counts.sum(axis=1, keepdims=True)
+    p = jnp.nan_to_num(p)  # replace NaNs from zero rows with zeros
+    return -jnp.sum(p * jnp.log(p + 1e-10))
 
 
 @jax.jit
@@ -453,6 +471,75 @@ def innovate(key, library):
     return library.at[insert_idx].set(new_recipe)
 
 
+@jax.jit
+def compute_population_jaccard(libraries):
+    """
+    Computes the mean pairwise Jaccard distance for an entire population.
+
+    Args:
+        libraries: jnp.ndarray of shape (n_agents, max_library_len, max_recipe_len)
+
+    Returns:
+        mean_dist: Scalar float representing the average diversity.
+        dist_matrix: The full (N, N) distance matrix.
+    """
+    N_AGENTS, L, R = libraries.shape
+
+    def single_pair_jaccard(lib1, lib2):
+        # 1. Identify valid recipes (ignore empty padding)
+        # A recipe is valid if it contains at least one non-zero token
+        valid1 = jnp.any(lib1 != 0, axis=-1)
+        valid2 = jnp.any(lib2 != 0, axis=-1)
+
+        # 2. Handle duplicates WITHIN each library (emulating a Set)
+        # self_matches[x, y] is True if lib[x] == lib[y]
+        self_matches1 = jnp.all(lib1[:, None, :] == lib1[None, :, :], axis=-1)
+        self_matches2 = jnp.all(lib2[:, None, :] == lib2[None, :, :], axis=-1)
+
+        # argmax returns the *first* index of the maximum value (True).
+        # This acts as a deduplicator: it only flags the first time a recipe appears.
+        is_first1 = jnp.arange(L) == jnp.argmax(self_matches1, axis=1)
+        is_first2 = jnp.arange(L) == jnp.argmax(self_matches2, axis=1)
+
+        # The actual "Set" sizes for each agent
+        set1_mask = valid1 & is_first1
+        set2_mask = valid2 & is_first2
+        size1 = jnp.sum(set1_mask)
+        size2 = jnp.sum(set2_mask)
+
+        # 3. Find intersection BETWEEN libraries
+        # matches[x, y] is True if lib1[x] == lib2[y]
+        matches = jnp.all(lib1[:, None, :] == lib2[None, :, :], axis=-1)
+
+        # A unique recipe in lib1 is in lib2 if it matches ANY valid recipe in lib2
+        in_lib2 = jnp.any(matches & valid2[None, :], axis=1)
+
+        intersection = jnp.sum(set1_mask & in_lib2)
+        union = size1 + size2 - intersection
+
+        # 4. Calculate Jaccard Distance (1 - similarity)
+        # Using jnp.where avoids division by zero if both libraries are completely empty
+        jaccard_dist = jnp.where(union == 0, 0.0, 1.0 - (intersection / union))
+        return jaccard_dist
+
+    # 5. Vectorize across the population
+    # vmap across lib2, keeping lib1 fixed
+    vmap_lib2 = jax.vmap(single_pair_jaccard, in_axes=(None, 0))
+
+    # vmap across lib1 to generate the full N x N matrix
+    vmap_all = jax.vmap(vmap_lib2, in_axes=(0, None))
+
+    dist_matrix = vmap_all(libraries, libraries)
+
+    # 6. Compute mean of the upper triangle
+    # (We ignore self-comparisons on the diagonal where distance is 0)
+    num_pairs = N_AGENTS * (N_AGENTS - 1) / 2
+    upper_tri = jnp.triu(dist_matrix, k=1)
+    mean_dist = jnp.sum(upper_tri) / num_pairs
+
+    return mean_dist, dist_matrix
+
+
 def run_simulation_loop(
     key,
     plants,
@@ -476,6 +563,7 @@ def run_simulation_loop(
     # (foraged_plants, libraries) -> avg yields, success_rates
     vmapped_eval_library = jax.vmap(evaluate_library, in_axes=(0, 0))
 
+    @jax.jit
     def maybe_do_innovation(key, library, history):
         keys = jax.random.split(key, n_innov_attempts)
 
@@ -507,6 +595,9 @@ def run_simulation_loop(
     # (libraries) -> library_sizes
     vmapped_get_library_size = jax.vmap(get_library_size)
 
+    # (libraries) -> library_entropies
+    vmapped_get_library_entropy = jax.vmap(get_library_entropy)
+
     def body_fn(carry, t):
         key, libraries, energies, histories = carry
 
@@ -532,12 +623,17 @@ def run_simulation_loop(
             innov_keys, libraries, histories
         )
 
+        # compute population diversity (in terms of libraries)
+        pop_diversity, _ = compute_population_jaccard(libraries)
+
         return (key, libraries, energies, histories), (
             energies,
             avg_yields,
             success_rates,
             vmapped_get_library_size(libraries),
+            vmapped_get_library_entropy(libraries),
             expected_innov_returns,
+            pop_diversity,
         )
 
     histories = jnp.zeros(
@@ -549,14 +645,24 @@ def run_simulation_loop(
     carry = (key, libraries, energies, histories)
 
     carry, metrics = jax.lax.scan(body_fn, carry, jnp.arange(T))
-    energies, yields, success_rates, library_sizes, innov_returns = metrics
+    (
+        energies,
+        yields,
+        success_rates,
+        library_sizes,
+        library_complexities,
+        innov_returns,
+        diversities,
+    ) = metrics
 
     return (
         energies,
         yields,
         success_rates,
         library_sizes,
+        library_complexities,
         innov_returns,
+        diversities,
     )
 
 
@@ -565,24 +671,16 @@ max_level = 10
 plants = pregenerate_plants(key, num_per_level=100, max_level=max_level)
 n_agents, n_forage, T = 10, 10, 1000
 
-# print(atomic_rules.shape)
-# print(atomic_rules)
-
-# print(initial_library.shape)
-# print(initial_library)
-
-# libraries = jnp.tile(initial_library[None, ...], (n_agents, 1, 1))
-# print(libraries.shape)
-# print(libraries[0])
-# print(libraries[1])
-
-# print(initial_library.shape)
-# print(initial_library)
-
 start_time = time.time()
-energies, yields, success_rates, library_sizes, innov_returns = jax.block_until_ready(
-    run_simulation_loop(key, plants, n_agents, T, n_forage)
-)
+(
+    energies,
+    yields,
+    success_rates,
+    library_sizes,
+    library_complexities,
+    innov_returns,
+    diversities,
+) = jax.block_until_ready(run_simulation_loop(key, plants, n_agents, T, n_forage))
 elapsed_time = time.time() - start_time
 print(f"Simulation completed in {elapsed_time:.2f} seconds.")
 
@@ -618,8 +716,10 @@ for m in range(n_agents):
                 "yield": float(yields_ma[t, m]),
                 "success_rate": float(success_rates_ma[t, m]),
                 "library_size": int(library_sizes[t, m]),
+                "library_complexity": float(library_complexities[t, m]),
                 "innov_return": float(innov_returns_ma[t, m]),
                 "num_innovations": int(num_innovations[t, m]),
+                "diversity": float(diversities[t]),
             }
         )
 df = pd.DataFrame(df)
@@ -654,13 +754,13 @@ for hue in ["agent", None]:
     sns.lineplot(
         df,
         x="t",
-        y="library_size",
+        y="library_complexity",
         hue=hue,
         ax=axs[3],
         legend=False,
         palette=palette,
     )
-    axs[3].set_title("Library size")
+    axs[3].set_title("Library complexity")
 
     sns.lineplot(
         df,
@@ -689,3 +789,10 @@ for hue in ["agent", None]:
 
     plt.tight_layout()
     fig.savefig(f"figures/simulation_plots_{'per_agent' if hue else 'pop_average'}.png")
+
+fig, ax = plt.subplots()
+sns.lineplot(df, x="t", y="diversity", ax=ax)
+ax.set_title("Population diversity (mean pairwise Jaccard distance)")
+sns.despine(ax=ax, left=True, bottom=True)
+plt.tight_layout()
+fig.savefig("figures/simulation_plots_diversity.png")
