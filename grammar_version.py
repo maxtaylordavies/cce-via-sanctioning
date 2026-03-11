@@ -1,9 +1,11 @@
 from functools import partial
+import time
 
 import jax
 import jax.numpy as jnp
 import seaborn as sns
 import matplotlib.pyplot as plt
+import pandas as pd
 
 sns.set_style("whitegrid")
 
@@ -31,8 +33,8 @@ MAX_EXPANSION_LEN = max(
 )
 MAX_RULE_LEN = MAX_EXPANSION_LEN
 MAX_PLANT_LEN = 30
-MAX_RECIPE_LEN = 5
-MAX_LIBRARY_SIZE = 10
+MAX_RECIPE_LEN = 10
+MAX_LIBRARY_SIZE = 50
 MAX_ENERGY = 200
 BASE_YIELD = 1.0
 BACKGROUND_ENERGY_LOSS = 0.5
@@ -451,29 +453,37 @@ def innovate(key, library):
 
 
 def run_simulation_loop(
-    key, plants, T, n_forage, n_innov_attempts=1, innov_cost=0.1, history_len=10
+    key,
+    plants,
+    n_agents,
+    T,
+    n_forage,
+    n_innov_attempts=1,
+    innov_cost=0.1,
+    history_len=10,
 ):
     max_level = plants.shape[0] - 1
 
-    def body_fn(carry, t):
-        key, library, energy, history = carry
-        key, forage_key, innov_key = jax.random.split(key, 3)
-        innov_keys = jax.random.split(innov_key, n_innov_attempts)
+    # (keys, energies) -> foraged_plants, levels
+    vmapped_forage = jax.vmap(
+        lambda k, e: forage(k, plants, e, max_level, n_forage), in_axes=(0, 0)
+    )
 
-        # forage for a batch of plants based on current energy level
-        foraged, _ = forage(forage_key, plants, energy, max_level, n_forage)
+    # (histories, foraged_plants) -> updated_histories
+    vmapped_update_history = jax.vmap(update_forage_history, in_axes=(0, 0))
 
-        # update history with new foraged batch
-        history = update_forage_history(history, foraged)
+    # (foraged_plants, libraries) -> avg yields, success_rates
+    vmapped_eval_library = jax.vmap(evaluate_library, in_axes=(0, 0))
 
-        # process the batch of plants with the current recipe library
-        avg_yield, success_rate = evaluate_library(foraged, library)
-        energy = jnp.clip(energy + avg_yield - BACKGROUND_ENERGY_LOSS, 0, MAX_ENERGY)
+    def maybe_do_innovation(key, library, history):
+        keys = jax.random.split(key, n_innov_attempts)
 
-        # apply a random innovation to the library and adopt it if expected benefit > cost
+        # compute avg yield of current library over n-step history
         history_flattened = history.reshape(-1, MAX_PLANT_LEN)
         baseline = evaluate_library(history_flattened, library)[0]
-        candidate_libraries = jax.vmap(lambda k: innovate(k, library))(innov_keys)
+
+        # produce a set of candidate innovations and evaluate them over the same history
+        candidate_libraries = jax.vmap(lambda k: innovate(k, library))(keys)
         yield_deltas = jax.vmap(
             lambda lib: evaluate_library(history_flattened, lib)[0] - baseline
         )(candidate_libraries)
@@ -482,25 +492,64 @@ def run_simulation_loop(
         )
         returns = yield_deltas - (innov_cost * diff_sizes)
 
+        # accept the best innovation if it has positive expected return
         best_idx = jnp.argmax(returns)
         new_library = candidate_libraries[best_idx]
         innovation_accepted = returns[best_idx] > 0
         library = jnp.where(innovation_accepted, new_library, library)
 
-        return (key, library, energy, history), (
-            energy,
-            avg_yield,
-            success_rate,
-            get_library_size(library),
-            returns[best_idx],
-            # size_deltas[best_idx],
-            # yield_deltas[best_idx],
+        return library, returns[best_idx]
+
+    # (keys, libraries, histories) -> updated_libraries, innov_returns
+    vmapped_do_innovation = jax.vmap(maybe_do_innovation, in_axes=(0, 0, 0))
+
+    # (libraries) -> library_sizes
+    vmapped_get_library_size = jax.vmap(get_library_size)
+
+    def body_fn(carry, t):
+        key, libraries, energies, histories = carry
+
+        # get new keys
+        key, forage_key, innov_key = jax.random.split(key, 3)
+        forage_keys = jax.random.split(forage_key, n_agents)
+        innov_keys = jax.random.split(innov_key, n_agents)
+
+        # each agent forages a batch of plants based on their current energy level
+        foraged, _ = vmapped_forage(forage_keys, energies)
+
+        # update each agent's forage history with new batch
+        histories = vmapped_update_history(histories, foraged)
+
+        # process each agent's foraged batch with their current library, then update their energy based on yield
+        avg_yields, success_rates = vmapped_eval_library(foraged, libraries)
+        energies = jnp.clip(
+            energies + avg_yields - BACKGROUND_ENERGY_LOSS, 0, MAX_ENERGY
         )
 
-    history = jnp.zeros((history_len, n_forage, MAX_PLANT_LEN), dtype=jnp.int32)
-    carry = (key, initial_library, 0, history)
+        # each agent attempts an innovation and updates their library if successful
+        libraries, expected_innov_returns = vmapped_do_innovation(
+            innov_keys, libraries, histories
+        )
+
+        return (key, libraries, energies, histories), (
+            energies,
+            avg_yields,
+            success_rates,
+            vmapped_get_library_size(libraries),
+            expected_innov_returns,
+        )
+
+    histories = jnp.zeros(
+        (n_agents, history_len, n_forage, MAX_PLANT_LEN), dtype=jnp.int32
+    )
+    # repeat initial library across agents
+    libraries = jnp.tile(initial_library[None, :], (n_agents, 1, 1, 1, 1))
+    energies = jnp.zeros(n_agents, dtype=jnp.float32)
+    carry = (key, libraries, energies, histories)
+
     carry, metrics = jax.lax.scan(body_fn, carry, jnp.arange(T))
     energies, yields, success_rates, library_sizes, innov_returns = metrics
+
     return (
         energies,
         yields,
@@ -513,20 +562,28 @@ def run_simulation_loop(
 key = jax.random.PRNGKey(0)
 max_level = 10
 plants = pregenerate_plants(key, num_per_level=100, max_level=max_level)
+n_agents, n_forage, T = 10, 10, 1000
 
-n_forage, T = 10, 5000
-energies, yields, success_rates, library_sizes, innov_returns = run_simulation_loop(
-    key, plants, T, n_forage
+start_time = time.time()
+energies, yields, success_rates, library_sizes, innov_returns = jax.block_until_ready(
+    run_simulation_loop(key, plants, n_agents, T, n_forage)
 )
-num_innovations = jnp.cumsum((innov_returns > 0).astype(jnp.int32))
+elapsed_time = time.time() - start_time
+print(f"Simulation completed in {elapsed_time:.2f} seconds.")
+
+num_innovations = jnp.cumsum((innov_returns > 0).astype(jnp.int32), axis=0)
+print(num_innovations.shape)
 
 # compute moving averages
 window_size = 50
 
 
-def moving_average(x):
+def single_agent_ma(x):
     cumsum = jnp.cumsum(jnp.insert(x, 0, 0))
     return (cumsum[window_size:] - cumsum[:-window_size]) / window_size
+
+
+moving_average = jax.vmap(single_agent_ma, in_axes=1, out_axes=1)
 
 
 t_ma = jnp.arange(T - window_size + 1)
@@ -534,29 +591,86 @@ yields_ma = moving_average(yields)
 success_rates_ma = moving_average(success_rates)
 innov_returns_ma = moving_average(innov_returns)
 
-fig, axs = plt.subplots(2, 3, figsize=(13, 7), sharex=True)
-axs = axs.flatten()
+df = []
+for m in range(n_agents):
+    for t in range(0, T, 10):
+        df.append(
+            {
+                "agent": m,
+                "t": t,
+                "t_ma": int(t_ma[t]),
+                "energy": float(energies[t, m]),
+                "yield": float(yields_ma[t, m]),
+                "success_rate": float(success_rates_ma[t, m]),
+                "library_size": int(library_sizes[t, m]),
+                "innov_return": float(innov_returns_ma[t, m]),
+                "num_innovations": int(num_innovations[t, m]),
+            }
+        )
+df = pd.DataFrame(df)
 
-sns.lineplot(x=jnp.arange(T), y=energies, ax=axs[0])
-axs[0].set_title("Energy")
+for hue in ["agent", None]:
+    palette = "crest" if hue else None
 
-sns.lineplot(x=t_ma, y=yields_ma, ax=axs[1])
-axs[1].set_title("Average yield")
+    fig, axs = plt.subplots(2, 3, figsize=(13, 7), sharex=True)
+    axs = axs.flatten()
 
-sns.lineplot(x=t_ma, y=success_rates_ma, ax=axs[2])
-axs[2].set_title("Success rate")
+    sns.lineplot(
+        df, x="t", y="energy", hue=hue, ax=axs[0], legend=False, palette=palette
+    )
+    axs[0].set_title("Energy")
 
-sns.lineplot(x=jnp.arange(T), y=library_sizes, ax=axs[3])
-axs[3].set_title("Library size")
+    sns.lineplot(
+        df, x="t_ma", y="yield", hue=hue, ax=axs[1], legend=False, palette=palette
+    )
+    axs[1].set_title("Average yield")
 
-sns.lineplot(x=t_ma, y=innov_returns_ma, ax=axs[4])
-axs[4].set_title("Expected return of innovation")
+    sns.lineplot(
+        df,
+        x="t_ma",
+        y="success_rate",
+        hue=hue,
+        ax=axs[2],
+        legend=False,
+        palette=palette,
+    )
+    axs[2].set_title("Success rate")
 
-sns.lineplot(x=jnp.arange(T), y=num_innovations, ax=axs[5])
-axs[5].set_title("Total number of innovations")
+    sns.lineplot(
+        df,
+        x="t",
+        y="library_size",
+        hue=hue,
+        ax=axs[3],
+        legend=False,
+        palette=palette,
+    )
+    axs[3].set_title("Library size")
 
-for ax in axs:
-    sns.despine(ax=ax, left=True, bottom=True)
+    sns.lineplot(
+        df,
+        x="t_ma",
+        y="innov_return",
+        hue=hue,
+        ax=axs[4],
+        legend=False,
+        palette=palette,
+    )
+    axs[4].set_title("Expected return of innovation")
 
-plt.tight_layout()
-plt.show()
+    sns.lineplot(
+        df,
+        x="t",
+        y="num_innovations",
+        hue=hue,
+        ax=axs[5],
+        legend=False,
+        palette=palette,
+    )
+    axs[5].set_title("Total number of innovations")
+
+    for ax in axs:
+        sns.despine(ax=ax, left=True, bottom=True)
+
+    plt.tight_layout()
+    fig.savefig(f"figures/simulation_plots_{'per_agent' if hue else 'pop_average'}.png")
