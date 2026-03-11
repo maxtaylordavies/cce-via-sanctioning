@@ -66,18 +66,20 @@ HAS_REVERSE_RULES = jnp.array(
 
 
 # construct initial recipe library from atomic forward rules
-initial_library = jnp.zeros(
-    (MAX_LIBRARY_SIZE, MAX_RECIPE_LEN, 2, MAX_RULE_LEN), dtype=jnp.int32
-)
+atomic_rules = [jnp.zeros((2, MAX_RULE_LEN), dtype=jnp.int32)]
+initial_library = jnp.zeros((MAX_LIBRARY_SIZE, MAX_RECIPE_LEN), dtype=jnp.int32)
 zeros, counter = jnp.zeros(MAX_RULE_LEN, dtype=jnp.int32), 0
 for k, vs in REVERSE_RULES.items():
     rule_result = zeros.at[0].set(k)
     for v in vs:
         rule_target = zeros.at[: len(v)].set(v)
-        initial_library = initial_library.at[counter, 0, 0].set(rule_target)
-        initial_library = initial_library.at[counter, 0, 1].set(rule_result)
+
+        rule = jnp.stack([rule_target, rule_result], axis=0)
+        atomic_rules.append(rule)
+
+        initial_library = initial_library.at[counter, 0].set(counter + 1)
         counter += 1
-NUM_ATOMIC_RULES = counter
+atomic_rules = jnp.stack(atomic_rules, axis=0)
 
 
 @partial(jax.jit, static_argnames=["complexity_level"])
@@ -289,8 +291,8 @@ def apply_recipe(plant, recipe):
         jnp.ndarray[int32] shape (MAX_PLANT_LEN,), updated plant after applying all rules in the recipe.
     """
 
-    def body_fn(plant, rule):
-        target, replacement = rule
+    def body_fn(plant, rule_idx):
+        target, replacement = atomic_rules[rule_idx]
         return apply_rule(plant, target, replacement), None
 
     return jax.lax.scan(body_fn, plant, recipe)[0]
@@ -320,7 +322,7 @@ def evaluate_library(plants, library, rule_cost=0.2):
         yields = successes.astype(jnp.float32) * BASE_YIELD * plant_length
 
         # calculate the actual length of each recipe (number of non-PAD rules)
-        recipe_lengths = jnp.sum(jnp.any(library != PAD, axis=(2, 3)), axis=1)
+        recipe_lengths = jnp.sum(library != PAD, axis=1)
         yields -= rule_cost * recipe_lengths  # penalize longer recipes
 
         yields = jnp.maximum(yields, 0.0)  # ensure yields are non-negative
@@ -332,7 +334,7 @@ def evaluate_library(plants, library, rule_cost=0.2):
 
 @jax.jit
 def get_recipe_length(recipe):
-    return jnp.sum(jnp.any(recipe != PAD, axis=(1, 2)))
+    return jnp.sum(recipe != PAD)
 
 
 @jax.jit
@@ -342,7 +344,7 @@ def get_library_size(library):
 
 @jax.jit
 def get_diff_size(library_1, library_2):
-    return jnp.any((library_2 != library_1), axis=(2, 3)).astype(jnp.int32).sum()
+    return (library_2 != library_1).astype(jnp.int32).sum()
 
 
 @jax.jit
@@ -350,8 +352,7 @@ def add_rule(key, recipe):
     key_rule, key_insert = jax.random.split(key)
 
     # sample an atomic rule to add
-    atomic_rule_idx = jax.random.randint(key_rule, (), 0, NUM_ATOMIC_RULES)
-    atomic_rule = initial_library[atomic_rule_idx, 0]
+    atomic_rule_idx = jax.random.randint(key_rule, (), 1, atomic_rules.shape[0])
 
     # find the first empty slot in the recipe
     num_rules = get_recipe_length(recipe)
@@ -361,7 +362,7 @@ def add_rule(key, recipe):
     # if the recipe is full, insert at a random index (overwriting an existing rule)
     overwrite_idx = jax.random.randint(key_insert, (), 0, num_rules)
     insert_idx = jnp.where(recipe_full, overwrite_idx, insert_idx)
-    return recipe.at[insert_idx].set(atomic_rule)
+    return recipe.at[insert_idx].set(atomic_rule_idx)
 
 
 @jax.jit
@@ -372,12 +373,12 @@ def delete_rule(key, recipe):
 
     # safe sampling bounds even when empty recipe
     maxval = jnp.maximum(num_rules, 1)
-    rule_idx = jax.random.randint(key, (), 0, maxval)
+    pos_idx = jax.random.randint(key, (), 0, maxval)
 
     positions = jnp.arange(MAX_RECIPE_LEN, dtype=jnp.int32)
 
     # For positions >= rule_idx, shift source left by one (drop rule_idx)
-    src_idx = jnp.where(positions < rule_idx, positions, positions + 1)
+    src_idx = jnp.where(positions < pos_idx, positions, positions + 1)
     src_idx = jnp.clip(src_idx, 0, MAX_RECIPE_LEN - 1)
 
     shifted = recipe[src_idx]
@@ -387,7 +388,7 @@ def delete_rule(key, recipe):
 
     # Zero out trailing rows beyond new length
     valid_rows = positions < new_len
-    new_recipe = jnp.where(valid_rows[:, None, None], shifted, 0)
+    new_recipe = jnp.where(valid_rows, shifted, 0)
 
     # If no rules existed, keep recipe unchanged
     return jnp.where(has_rules, new_recipe, recipe)
@@ -410,14 +411,14 @@ def combine_recipes(recipe_1, recipe_2):
     gathered_first = recipe_1[src_idx_first]
     gathered_second = recipe_2[src_idx_second]
 
-    combined = jnp.where(use_first[:, None, None], gathered_first, gathered_second)
+    combined = jnp.where(use_first, gathered_first, gathered_second)
 
     # Logical concatenated length, clipped to capacity
     total_len = jnp.minimum(len_1 + len_2, MAX_RECIPE_LEN)
     valid_rows = positions < total_len
 
     # Zero-pad remainder
-    return jnp.where(valid_rows[:, None, None], combined, 0)
+    return jnp.where(valid_rows, combined, 0)
 
 
 @jax.jit
@@ -430,7 +431,7 @@ def innovate(key, library):
 
     # sample recipe(s) from the library to modify
     # get the number of actual recipes in the library (those that have at least one non-PAD rule)
-    num_recipes = jnp.sum(jnp.any(library != PAD, axis=(1, 2, 3)))
+    num_recipes = jnp.sum(jnp.any(library != PAD, axis=1))
     recipe_idxs = jax.random.randint(
         key_recipe, shape=(2,), minval=0, maxval=num_recipes
     )
@@ -543,7 +544,7 @@ def run_simulation_loop(
         (n_agents, history_len, n_forage, MAX_PLANT_LEN), dtype=jnp.int32
     )
     # repeat initial library across agents
-    libraries = jnp.tile(initial_library[None, :], (n_agents, 1, 1, 1, 1))
+    libraries = jnp.tile(initial_library[None, ...], (n_agents, 1, 1))
     energies = jnp.zeros(n_agents, dtype=jnp.float32)
     carry = (key, libraries, energies, histories)
 
@@ -563,6 +564,20 @@ key = jax.random.PRNGKey(0)
 max_level = 10
 plants = pregenerate_plants(key, num_per_level=100, max_level=max_level)
 n_agents, n_forage, T = 10, 10, 1000
+
+# print(atomic_rules.shape)
+# print(atomic_rules)
+
+# print(initial_library.shape)
+# print(initial_library)
+
+# libraries = jnp.tile(initial_library[None, ...], (n_agents, 1, 1))
+# print(libraries.shape)
+# print(libraries[0])
+# print(libraries[1])
+
+# print(initial_library.shape)
+# print(initial_library)
 
 start_time = time.time()
 energies, yields, success_rates, library_sizes, innov_returns = jax.block_until_ready(
