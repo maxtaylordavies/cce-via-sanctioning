@@ -189,6 +189,19 @@ def forage(key, plants, energy, max_level, n):
 
 
 @jax.jit
+def update_forage_history(history, new_foraged):
+    history_len = history.shape[0]
+    history = (
+        jnp.zeros_like(history)
+        .at[: history_len - 1]
+        .set(history[1:])
+        .at[-1]
+        .set(new_foraged)
+    )
+    return history
+
+
+@jax.jit
 def apply_rule(
     plant,
     target,
@@ -282,7 +295,7 @@ def apply_recipe(plant, recipe):
 
 
 @jax.jit
-def evaluate_library(plants, levels, library, rule_cost=0.2):
+def evaluate_library(plants, library, rule_cost=0.2):
     """
     Evaluates a library of recipes on a batch of plants.
 
@@ -294,14 +307,15 @@ def evaluate_library(plants, levels, library, rule_cost=0.2):
         average yield across batch
     """
 
-    def eval_single_plant(plant, level):
+    def eval_single_plant(plant):
         processed = jax.vmap(lambda recipe: apply_recipe(plant, recipe))(library)
 
         # determine if each processed plant matches the goal plant
         successes = jnp.all(processed == GOAL_PLANT, axis=1)
 
         # scale successful yields by original plant complexity (number of non-PAD tokens)
-        yields = successes.astype(jnp.float32) * BASE_YIELD * level
+        plant_length = jnp.sum(plant != PAD)
+        yields = successes.astype(jnp.float32) * BASE_YIELD * plant_length
 
         # calculate the actual length of each recipe (number of non-PAD rules)
         recipe_lengths = jnp.sum(jnp.any(library != PAD, axis=(2, 3)), axis=1)
@@ -310,7 +324,7 @@ def evaluate_library(plants, levels, library, rule_cost=0.2):
         yields = jnp.maximum(yields, 0.0)  # ensure yields are non-negative
         return yields.max()
 
-    yields = jax.vmap(eval_single_plant, in_axes=(0, 0))(plants, levels)
+    yields = jax.vmap(eval_single_plant)(plants)
     return yields.mean(), (yields > 0).mean()  # also return success rate
 
 
@@ -437,28 +451,31 @@ def innovate(key, library):
 
 
 def run_simulation_loop(
-    key, plants, T, n_forage, n_innov_attempts=1, innov_cost=0.1, n_test=50
+    key, plants, T, n_forage, n_innov_attempts=1, innov_cost=0.1, history_len=10
 ):
     max_level = plants.shape[0] - 1
 
     def body_fn(carry, t):
-        key, library, energy = carry
-        key, forage_key, innov_key, test_key = jax.random.split(key, 4)
+        key, library, energy, history = carry
+        key, forage_key, innov_key = jax.random.split(key, 3)
         innov_keys = jax.random.split(innov_key, n_innov_attempts)
 
         # forage for a batch of plants based on current energy level
-        foraged, levels = forage(forage_key, plants, energy, max_level, n_forage)
+        foraged, _ = forage(forage_key, plants, energy, max_level, n_forage)
+
+        # update history with new foraged batch
+        history = update_forage_history(history, foraged)
 
         # process the batch of plants with the current recipe library
-        avg_yield, success_rate = evaluate_library(foraged, levels, library)
+        avg_yield, success_rate = evaluate_library(foraged, library)
         energy = jnp.clip(energy + avg_yield - BACKGROUND_ENERGY_LOSS, 0, MAX_ENERGY)
 
         # apply a random innovation to the library and adopt it if expected benefit > cost
-        test_batch, test_levels = forage(test_key, plants, energy, max_level, n_test)
-        baseline = evaluate_library(test_batch, test_levels, library)[0]
+        history_flattened = history.reshape(-1, MAX_PLANT_LEN)
+        baseline = evaluate_library(history_flattened, library)[0]
         candidate_libraries = jax.vmap(lambda k: innovate(k, library))(innov_keys)
         yield_deltas = jax.vmap(
-            lambda lib: evaluate_library(test_batch, test_levels, lib)[0] - baseline
+            lambda lib: evaluate_library(history_flattened, lib)[0] - baseline
         )(candidate_libraries)
         diff_sizes = jax.vmap(lambda lib: get_diff_size(library, lib))(
             candidate_libraries
@@ -470,7 +487,7 @@ def run_simulation_loop(
         innovation_accepted = returns[best_idx] > 0
         library = jnp.where(innovation_accepted, new_library, library)
 
-        return (key, library, energy), (
+        return (key, library, energy, history), (
             energy,
             avg_yield,
             success_rate,
@@ -480,7 +497,8 @@ def run_simulation_loop(
             # yield_deltas[best_idx],
         )
 
-    carry = (key, initial_library, 0)
+    history = jnp.zeros((history_len, n_forage, MAX_PLANT_LEN), dtype=jnp.int32)
+    carry = (key, initial_library, 0, history)
     carry, metrics = jax.lax.scan(body_fn, carry, jnp.arange(T))
     energies, yields, success_rates, library_sizes, innov_returns = metrics
     return (
