@@ -2,7 +2,6 @@ from functools import partial
 
 import jax
 import jax.numpy as jnp
-from tqdm import tqdm
 import seaborn as sns
 import matplotlib.pyplot as plt
 
@@ -32,11 +31,11 @@ MAX_EXPANSION_LEN = max(
 )
 MAX_RULE_LEN = MAX_EXPANSION_LEN
 MAX_PLANT_LEN = 30
-MAX_RECIPE_LEN = 10
-MAX_LIBRARY_SIZE = 50
-MAX_ENERGY = 100
-BASE_YIELD = 0.5
-BACKGROUND_ENERGY_LOSS = 0.2
+MAX_RECIPE_LEN = 5
+MAX_LIBRARY_SIZE = 10
+MAX_ENERGY = 200
+BASE_YIELD = 1.0
+BACKGROUND_ENERGY_LOSS = 0.5
 
 GOAL_PLANT = jnp.zeros(MAX_PLANT_LEN, dtype=jnp.int32).at[0].set(N)
 
@@ -156,6 +155,39 @@ def pregenerate_plants(key, num_per_level, max_level):
     return plants
 
 
+@partial(jax.jit, static_argnames=["max_level", "n"])
+def forage(key, plants, energy, max_level, n):
+    curr_max_level_idx = jnp.floor((energy / (MAX_ENERGY + 1)) * max_level).astype(
+        jnp.int32
+    )
+
+    # Uniform over levels [1 .. curr_max_level_idx], zero otherwise.
+    # p_level_idx indexes levels 1..max_level (length max_level).
+    idx = jnp.arange(max_level, dtype=jnp.int32)
+    active = idx <= curr_max_level_idx
+
+    # uniform over active levels
+    p_level_idx = active.astype(jnp.float32)
+    p_level_idx /= p_level_idx.sum()
+
+    # small bias toward the current max level
+    # max active level index in 0-based space:
+    bias_bonus = 0.20  # tune this (e.g. 0.05 to 0.20)
+    p_level_idx = p_level_idx.at[curr_max_level_idx].add(bias_bonus)
+
+    # renormalize
+    p_level_idx = p_level_idx / p_level_idx.sum()
+
+    def single(key):
+        key_level, key_plant = jax.random.split(key)
+        level = jax.random.choice(key_level, max_level, p=p_level_idx) + 1
+        plant = jax.random.choice(key_plant, plants[level], axis=0)
+        return plant, level
+
+    plants_out, levels = jax.vmap(single)(jax.random.split(key, n))
+    return plants_out, levels
+
+
 @jax.jit
 def apply_rule(
     plant,
@@ -250,139 +282,260 @@ def apply_recipe(plant, recipe):
 
 
 @jax.jit
-def evaluate_library_on_plant(plant, library, rule_cost=0.1):
+def evaluate_library(plants, levels, library, rule_cost=0.2):
     """
-    Evaluates a library of recipes on a single plant.
+    Evaluates a library of recipes on a batch of plants.
 
     Args:
-        plant: jnp.ndarray[int32] shape (MAX_PLANT_LEN,), PAD-terminated.
+        plants: jnp.ndarray[int32] shape (batch_size, MAX_PLANT_LEN), PAD-terminated.
         library: jnp.ndarray[int32] shape (num_recipes, num_rules, 2, MAX_RULE_LEN), where each recipe is a sequence of [target, replacement] stacked and PAD-terminated.
 
     Returns:
-        jnp.ndarray[float32] shape (), yield from best recipe
-        jnp.ndarray[int32] shape (), index of best recipe
+        average yield across batch
     """
-    processed = jax.vmap(lambda recipe: apply_recipe(plant, recipe))(library)
 
-    # determine if each processed plant matches the goal plant
-    successes = jnp.all(processed == GOAL_PLANT, axis=1)
+    def eval_single_plant(plant, level):
+        processed = jax.vmap(lambda recipe: apply_recipe(plant, recipe))(library)
 
-    # scale successful yields by original plant complexity (number of non-PAD tokens)
-    complexity = jnp.sum(plant != PAD)
-    yields = successes.astype(jnp.float32) * BASE_YIELD * complexity
+        # determine if each processed plant matches the goal plant
+        successes = jnp.all(processed == GOAL_PLANT, axis=1)
 
-    # calculate the actual length of each recipe (number of non-PAD rules)
-    recipe_lengths = jnp.sum(jnp.any(library != PAD, axis=(2, 3)), axis=1)
-    yields -= rule_cost * recipe_lengths  # penalize longer recipes
+        # scale successful yields by original plant complexity (number of non-PAD tokens)
+        yields = successes.astype(jnp.float32) * BASE_YIELD * level
 
-    yields = jnp.maximum(yields, 0.0)  # ensure yields are non-negative
-    best_idx = jnp.argmax(yields)
-    return yields[best_idx], best_idx
+        # calculate the actual length of each recipe (number of non-PAD rules)
+        recipe_lengths = jnp.sum(jnp.any(library != PAD, axis=(2, 3)), axis=1)
+        yields -= rule_cost * recipe_lengths  # penalize longer recipes
+
+        yields = jnp.maximum(yields, 0.0)  # ensure yields are non-negative
+        return yields.max()
+
+    yields = jax.vmap(eval_single_plant, in_axes=(0, 0))(plants, levels)
+    return yields.mean(), (yields > 0).mean()  # also return success rate
 
 
 @jax.jit
-def innovate_extend(key, library):
-    key_recipe, key_rule, key_insert = jax.random.split(key, 3)
+def get_recipe_length(recipe):
+    return jnp.sum(jnp.any(recipe != PAD, axis=(1, 2)))
 
-    # get the number of actual recipes in the library (those that have at least one non-PAD rule)
-    num_recipes = jnp.sum(jnp.any(library != PAD, axis=(1, 2, 3)))
-    library_full = num_recipes >= MAX_LIBRARY_SIZE
 
-    # sample a recipe to extend
-    recipe_idx = jax.random.randint(key_recipe, (), 0, num_recipes)
+@jax.jit
+def get_library_size(library):
+    return jax.vmap(get_recipe_length)(library).sum()
+
+
+@jax.jit
+def get_diff_size(library_1, library_2):
+    return jnp.any((library_2 != library_1), axis=(2, 3)).astype(jnp.int32).sum()
+
+
+@jax.jit
+def add_rule(key, recipe):
+    key_rule, key_insert = jax.random.split(key)
 
     # sample an atomic rule to add
     atomic_rule_idx = jax.random.randint(key_rule, (), 0, NUM_ATOMIC_RULES)
     atomic_rule = initial_library[atomic_rule_idx, 0]
 
     # find the first empty slot in the recipe
-    num_rules = jnp.sum(jnp.any(library[recipe_idx] != PAD, axis=(1, 2)))
+    num_rules = get_recipe_length(recipe)
     recipe_full = num_rules >= MAX_RECIPE_LEN
     insert_idx = num_rules % MAX_RECIPE_LEN
 
-    # if the recipe isn't full, insert the selected rule
-    new_recipe = library[recipe_idx].at[insert_idx].set(atomic_rule)
-    new_recipe = jnp.where(recipe_full, library[recipe_idx], new_recipe)
+    # if the recipe is full, insert at a random index (overwriting an existing rule)
+    overwrite_idx = jax.random.randint(key_insert, (), 0, num_rules)
+    insert_idx = jnp.where(recipe_full, overwrite_idx, insert_idx)
+    return recipe.at[insert_idx].set(atomic_rule)
 
-    # if the library is full, select a random index to overwrite with the new recipe
-    overwrite_idx = jax.random.randint(key_insert, (), 0, num_recipes)
-    insert_idx = jnp.where(library_full, overwrite_idx, num_recipes)
+
+@jax.jit
+def delete_rule(key, recipe):
+    # find the number of rules in the recipe
+    num_rules = get_recipe_length(recipe)
+    has_rules = num_rules > 0
+
+    # safe sampling bounds even when empty recipe
+    maxval = jnp.maximum(num_rules, 1)
+    rule_idx = jax.random.randint(key, (), 0, maxval)
+
+    positions = jnp.arange(MAX_RECIPE_LEN, dtype=jnp.int32)
+
+    # For positions >= rule_idx, shift source left by one (drop rule_idx)
+    src_idx = jnp.where(positions < rule_idx, positions, positions + 1)
+    src_idx = jnp.clip(src_idx, 0, MAX_RECIPE_LEN - 1)
+
+    shifted = recipe[src_idx]
+
+    # New logical length after deletion
+    new_len = jnp.maximum(num_rules - 1, 0)
+
+    # Zero out trailing rows beyond new length
+    valid_rows = positions < new_len
+    new_recipe = jnp.where(valid_rows[:, None, None], shifted, 0)
+
+    # If no rules existed, keep recipe unchanged
+    return jnp.where(has_rules, new_recipe, recipe)
+
+
+@jax.jit
+def combine_recipes(recipe_1, recipe_2):
+    len_1 = get_recipe_length(recipe_1)
+    len_2 = get_recipe_length(recipe_2)
+
+    positions = jnp.arange(MAX_RECIPE_LEN, dtype=jnp.int32)
+
+    # For each output row i:
+    # - take recipe_1[i] when i < len_1
+    # - else take recipe_2[i - len_1]
+    use_first = positions < len_1
+    src_idx_first = positions
+    src_idx_second = jnp.clip(positions - len_1, 0, MAX_RECIPE_LEN - 1)
+
+    gathered_first = recipe_1[src_idx_first]
+    gathered_second = recipe_2[src_idx_second]
+
+    combined = jnp.where(use_first[:, None, None], gathered_first, gathered_second)
+
+    # Logical concatenated length, clipped to capacity
+    total_len = jnp.minimum(len_1 + len_2, MAX_RECIPE_LEN)
+    valid_rows = positions < total_len
+
+    # Zero-pad remainder
+    return jnp.where(valid_rows[:, None, None], combined, 0)
+
+
+@jax.jit
+def innovate(key, library):
+    key_op, key_recipe = jax.random.split(key)
+
+    # select which type of operation to perform: add a rule, delete a rule, or combine two recipes
+    op_probs = jnp.array([0.4, 0.4, 0.2])  # probabilities for add, delete, combine
+    op = jax.random.choice(key_op, 3, p=op_probs)
+
+    # sample recipe(s) from the library to modify
+    # get the number of actual recipes in the library (those that have at least one non-PAD rule)
+    num_recipes = jnp.sum(jnp.any(library != PAD, axis=(1, 2, 3)))
+    recipe_idxs = jax.random.randint(
+        key_recipe, shape=(2,), minval=0, maxval=num_recipes
+    )
+    recipe_1, recipe_2 = library[recipe_idxs]
+
+    # perform the selected operation
+    new_recipe = jax.lax.switch(
+        op,
+        [
+            lambda _: add_rule(key, recipe_1),
+            lambda _: delete_rule(key, recipe_1),
+            lambda _: combine_recipes(recipe_1, recipe_2),
+        ],
+        operand=None,
+    )
+
+    # store the new recipe
+    insert_idx = num_recipes % MAX_LIBRARY_SIZE
     return library.at[insert_idx].set(new_recipe)
 
 
-@partial(jax.jit, static_argnames=["max_level"])
-def forage(key, plants, energy, max_level):
-    key_level, key_plant = jax.random.split(key)
-
-    # energy is between 0 and MAX_ENERGY
-    # we want to bias foraging such that:
-    #   - at energy=0, p(level=0) = 1
-    #   - at energy=MAX_ENERGY, p(level=max_level) = 1
-    #   - p(level) should increase smoothly with energy, e.g. linearly interpolating between these extremes
-    m = (max_level * energy) / MAX_ENERGY
-    k = jnp.floor(m).astype(jnp.int32)
-    alpha = m - k
-    k = jnp.minimum(k, max_level)
-    p_level = jnp.zeros(max_level + 1).at[k].set(1.0 - alpha)
-    p_level = jax.lax.cond(
-        k < max_level, lambda p: p.at[k + 1].set(alpha), lambda p: p, p_level
-    )
-
-    level = jax.random.choice(key_level, max_level + 1, p=p_level)
-    plant = jax.random.choice(key_plant, plants[level], axis=0)
-    return plant, level
-
-
-def run_simulation_loop(key, plants, T):
+def run_simulation_loop(
+    key, plants, T, n_forage, n_innov_attempts=1, innov_cost=0.1, n_test=50
+):
     max_level = plants.shape[0] - 1
 
     def body_fn(carry, t):
         key, library, energy = carry
-        key, forage_key, innovate_key = jax.random.split(key, 3)
+        key, forage_key, innov_key, test_key = jax.random.split(key, 4)
+        innov_keys = jax.random.split(innov_key, n_innov_attempts)
 
-        plant, _ = forage(forage_key, plants, energy, max_level)
+        # forage for a batch of plants based on current energy level
+        foraged, levels = forage(forage_key, plants, energy, max_level, n_forage)
 
-        best_yield, _ = evaluate_library_on_plant(plant, library)
-        energy = jnp.clip(energy + best_yield - BACKGROUND_ENERGY_LOSS, 0, MAX_ENERGY)
+        # process the batch of plants with the current recipe library
+        avg_yield, success_rate = evaluate_library(foraged, levels, library)
+        energy = jnp.clip(energy + avg_yield - BACKGROUND_ENERGY_LOSS, 0, MAX_ENERGY)
 
-        new_library = innovate_extend(innovate_key, library)
-        library = jnp.where(best_yield > 0, library, new_library)
+        # apply a random innovation to the library and adopt it if expected benefit > cost
+        test_batch, test_levels = forage(test_key, plants, energy, max_level, n_test)
+        baseline = evaluate_library(test_batch, test_levels, library)[0]
+        candidate_libraries = jax.vmap(lambda k: innovate(k, library))(innov_keys)
+        yield_deltas = jax.vmap(
+            lambda lib: evaluate_library(test_batch, test_levels, lib)[0] - baseline
+        )(candidate_libraries)
+        diff_sizes = jax.vmap(lambda lib: get_diff_size(library, lib))(
+            candidate_libraries
+        )
+        returns = yield_deltas - (innov_cost * diff_sizes)
 
-        # compute average length of non-empty recipes in the library
-        recipe_lengths = jnp.sum(jnp.any(library != PAD, axis=(2, 3)), axis=1)
-        num_non_empty = jnp.sum(recipe_lengths > 0)
-        avg_length = recipe_lengths.sum() / jnp.maximum(num_non_empty, 1)
+        best_idx = jnp.argmax(returns)
+        new_library = candidate_libraries[best_idx]
+        innovation_accepted = returns[best_idx] > 0
+        library = jnp.where(innovation_accepted, new_library, library)
 
-        return (key, library, energy), (energy, best_yield, num_non_empty, avg_length)
+        return (key, library, energy), (
+            energy,
+            avg_yield,
+            success_rate,
+            get_library_size(library),
+            returns[best_idx],
+            # size_deltas[best_idx],
+            # yield_deltas[best_idx],
+        )
 
     carry = (key, initial_library, 0)
     carry, metrics = jax.lax.scan(body_fn, carry, jnp.arange(T))
-    energies, yields, num_recipes, avg_recipe_lengths = metrics
-    return energies, yields, num_recipes, avg_recipe_lengths
+    energies, yields, success_rates, library_sizes, innov_returns = metrics
+    return (
+        energies,
+        yields,
+        success_rates,
+        library_sizes,
+        innov_returns,
+    )
 
 
 key = jax.random.PRNGKey(0)
-max_level = 6
+max_level = 10
 plants = pregenerate_plants(key, num_per_level=100, max_level=max_level)
 
-T = 2000
-energies, yields, num_recipes, avg_recipe_lengths = run_simulation_loop(key, plants, T)
+n_forage, T = 10, 5000
+energies, yields, success_rates, library_sizes, innov_returns = run_simulation_loop(
+    key, plants, T, n_forage
+)
+num_innovations = jnp.cumsum((innov_returns > 0).astype(jnp.int32))
 
-# compute moving average of yields for smoother visualization
-window_size = 20
-cumsum = jnp.cumsum(jnp.insert(yields, 0, 0))
-moving_avg_yields = (cumsum[window_size:] - cumsum[:-window_size]) / window_size
+# compute moving averages
+window_size = 50
 
-fig, axs = plt.subplots(2, 2, figsize=(12, 10), sharex=True)
+
+def moving_average(x):
+    cumsum = jnp.cumsum(jnp.insert(x, 0, 0))
+    return (cumsum[window_size:] - cumsum[:-window_size]) / window_size
+
+
+t_ma = jnp.arange(T - window_size + 1)
+yields_ma = moving_average(yields)
+success_rates_ma = moving_average(success_rates)
+innov_returns_ma = moving_average(innov_returns)
+
+fig, axs = plt.subplots(2, 3, figsize=(13, 7), sharex=True)
 axs = axs.flatten()
+
 sns.lineplot(x=jnp.arange(T), y=energies, ax=axs[0])
-axs[0].set_title("Energy Over Time")
-sns.lineplot(x=jnp.arange(T - window_size + 1), y=moving_avg_yields, ax=axs[1])
-axs[1].set_title("Yield per Forage (Moving Average)")
-sns.lineplot(x=jnp.arange(T), y=num_recipes, ax=axs[2])
-axs[2].set_title("Number of Recipes in Library")
-sns.lineplot(x=jnp.arange(T), y=avg_recipe_lengths, ax=axs[3])
-axs[3].set_title("Average Recipe Length in Library")
+axs[0].set_title("Energy")
+
+sns.lineplot(x=t_ma, y=yields_ma, ax=axs[1])
+axs[1].set_title("Average yield")
+
+sns.lineplot(x=t_ma, y=success_rates_ma, ax=axs[2])
+axs[2].set_title("Success rate")
+
+sns.lineplot(x=jnp.arange(T), y=library_sizes, ax=axs[3])
+axs[3].set_title("Library size")
+
+sns.lineplot(x=t_ma, y=innov_returns_ma, ax=axs[4])
+axs[4].set_title("Expected return of innovation")
+
+sns.lineplot(x=jnp.arange(T), y=num_innovations, ax=axs[5])
+axs[5].set_title("Total number of innovations")
 
 for ax in axs:
     sns.despine(ax=ax, left=True, bottom=True)
