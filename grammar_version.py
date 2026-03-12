@@ -6,6 +6,7 @@ import jax.numpy as jnp
 import seaborn as sns
 import matplotlib.pyplot as plt
 import pandas as pd
+import numpy as np
 
 sns.set_style("whitegrid")
 
@@ -348,6 +349,11 @@ def get_diff_size(library_1, library_2):
 
 
 @jax.jit
+def get_num_recipes(library):
+    return jnp.sum(jnp.any(library != PAD, axis=1))
+
+
+@jax.jit
 def get_library_entropy(library):
     num_rules = atomic_rules.shape[0]
     transition_counts = jnp.zeros((num_rules, num_rules), dtype=jnp.int32)
@@ -449,7 +455,7 @@ def innovate(key, library):
 
     # sample recipe(s) from the library to modify
     # get the number of actual recipes in the library (those that have at least one non-PAD rule)
-    num_recipes = jnp.sum(jnp.any(library != PAD, axis=1))
+    num_recipes = get_num_recipes(library)
     recipe_idxs = jax.random.randint(
         key_recipe, shape=(2,), minval=0, maxval=num_recipes
     )
@@ -469,6 +475,30 @@ def innovate(key, library):
     # store the new recipe
     insert_idx = num_recipes % MAX_LIBRARY_SIZE
     return library.at[insert_idx].set(new_recipe)
+
+
+@partial(jax.jit, static_argnames=["n_agents"])
+def imitate_recipe(key, libraries, agent_idx, n_agents):
+    key_agent, key_recipe = jax.random.split(key)
+
+    # select an agent to imitate from (uniform over all other agents)
+    p_agent = jnp.ones(n_agents).at[agent_idx].set(0.0)
+    p_agent /= p_agent.sum()
+    demonstrator_idx = jax.random.choice(key_agent, n_agents, p=p_agent)
+
+    # select a recipe from the demonstrator's library to imitate
+    num_recipes = get_num_recipes(libraries[demonstrator_idx])
+    p_recipe = jnp.ones(MAX_LIBRARY_SIZE) * (jnp.arange(MAX_LIBRARY_SIZE) < num_recipes)
+    p_recipe /= p_recipe.sum()
+    recipe_idx = jax.random.choice(key_recipe, MAX_LIBRARY_SIZE, p=p_recipe)
+
+    # determine where to insert the imitated recipe in the imitator's library
+    insert_idx = get_num_recipes(libraries[agent_idx]) % MAX_LIBRARY_SIZE
+
+    # insert the imitated recipe and return the updated library
+    return (
+        libraries[agent_idx].at[insert_idx].set(libraries[demonstrator_idx, recipe_idx])
+    )
 
 
 @jax.jit
@@ -548,7 +578,10 @@ def run_simulation_loop(
     n_forage,
     n_innov_attempts=1,
     innov_cost=0.1,
+    imit_cost=0.05,
     history_len=10,
+    choice_beta=1.0,
+    learning_rate=0.01,
 ):
     max_level = plants.shape[0] - 1
 
@@ -563,34 +596,42 @@ def run_simulation_loop(
     # (foraged_plants, libraries) -> avg yields, success_rates
     vmapped_eval_library = jax.vmap(evaluate_library, in_axes=(0, 0))
 
+    # (old libraries, new libraries) -> diff sizes
+    vmapped_get_diff_size = jax.vmap(get_diff_size, in_axes=(0, 0))
+
     @jax.jit
-    def maybe_do_innovation(key, library, history):
-        keys = jax.random.split(key, n_innov_attempts)
+    def update_library(key, agent_idx, libraries, histories, roles):
+        innov_keys = jax.random.split(key, n_innov_attempts)
 
         # compute avg yield of current library over n-step history
-        history_flattened = history.reshape(-1, MAX_PLANT_LEN)
-        baseline = evaluate_library(history_flattened, library)[0]
+        hist = histories[agent_idx].reshape(-1, MAX_PLANT_LEN)
+        curr_yield = evaluate_library(hist, libraries[agent_idx])[0]
 
         # produce a set of candidate innovations and evaluate them over the same history
-        candidate_libraries = jax.vmap(lambda k: innovate(k, library))(keys)
-        yield_deltas = jax.vmap(
-            lambda lib: evaluate_library(history_flattened, lib)[0] - baseline
-        )(candidate_libraries)
-        diff_sizes = jax.vmap(lambda lib: get_diff_size(library, lib))(
+        candidate_libraries = jax.vmap(lambda k: innovate(k, libraries[agent_idx]))(
+            innov_keys
+        )
+        yields = jax.vmap(lambda lib: evaluate_library(hist, lib)[0])(
             candidate_libraries
         )
-        returns = yield_deltas - (innov_cost * diff_sizes)
+        best_innov_idx = yields.argmax()
+        innov_library, innov_yield = (
+            candidate_libraries[best_innov_idx],
+            yields[best_innov_idx],
+        )
 
-        # accept the best innovation if it has positive expected return
-        best_idx = jnp.argmax(returns)
-        new_library = candidate_libraries[best_idx]
-        innovation_accepted = returns[best_idx] > 0
-        library = jnp.where(innovation_accepted, new_library, library)
+        # also produce a library updated by random imitation
+        imitation_library = imitate_recipe(key, libraries, agent_idx, n_agents)
+        imitation_yield = evaluate_library(hist, imitation_library)[0]
 
-        return library, returns[best_idx]
+        # if role == 0, innovate; if role == 1, imitate
+        new_library = jnp.where(roles[agent_idx] == 0, innov_library, imitation_library)
+        new_yield = jnp.where(roles[agent_idx] == 0, innov_yield, imitation_yield)
+
+        return new_library, curr_yield, new_yield
 
     # (keys, libraries, histories) -> updated_libraries, innov_returns
-    vmapped_do_innovation = jax.vmap(maybe_do_innovation, in_axes=(0, 0, 0))
+    vmapped_update_library = jax.vmap(update_library, in_axes=(0, 0, None, None, None))
 
     # (libraries) -> library_sizes
     vmapped_get_library_size = jax.vmap(get_library_size)
@@ -599,10 +640,10 @@ def run_simulation_loop(
     vmapped_get_library_entropy = jax.vmap(get_library_entropy)
 
     def body_fn(carry, t):
-        key, libraries, energies, histories = carry
+        key, libraries, energies, histories, q_vals = carry
 
         # get new keys
-        key, forage_key, innov_key = jax.random.split(key, 3)
+        key, forage_key, policy_key, innov_key = jax.random.split(key, 4)
         forage_keys = jax.random.split(forage_key, n_agents)
         innov_keys = jax.random.split(innov_key, n_agents)
 
@@ -618,21 +659,35 @@ def run_simulation_loop(
             energies + avg_yields - BACKGROUND_ENERGY_LOSS, 0, MAX_ENERGY
         )
 
-        # each agent attempts an innovation and updates their library if successful
-        libraries, expected_innov_returns = vmapped_do_innovation(
-            innov_keys, libraries, histories
+        # each agent chooses a role based on their q-values
+        role_probs = jax.nn.softmax(q_vals / choice_beta, axis=1)
+        roles = jax.random.categorical(policy_key, jnp.log(role_probs), axis=1)
+
+        # each agent updates their library based on their chosen role
+        new_libraries, curr_yields, new_yields = vmapped_update_library(
+            innov_keys, jnp.arange(n_agents), libraries, histories, roles
         )
 
+        # compute rewards for each agent based on yield improvement and innovation/imitation costs
+        size_deltas = vmapped_get_diff_size(libraries, new_libraries)
+        costs = jnp.where(roles == 0, innov_cost * size_deltas, imit_cost)
+        rewards = (new_yields - curr_yields) - costs
+
+        # update q-values with a simple reward prediction error rule
+        rpe = rewards - q_vals[jnp.arange(n_agents), roles]
+        q_vals = q_vals.at[jnp.arange(n_agents), roles].add(learning_rate * rpe)
+
         # compute population diversity (in terms of libraries)
+        libraries = new_libraries
         pop_diversity, _ = compute_population_jaccard(libraries)
 
-        return (key, libraries, energies, histories), (
+        return (key, libraries, energies, histories, q_vals), (
             energies,
             avg_yields,
             success_rates,
             vmapped_get_library_size(libraries),
             vmapped_get_library_entropy(libraries),
-            expected_innov_returns,
+            q_vals,
             pop_diversity,
         )
 
@@ -642,7 +697,10 @@ def run_simulation_loop(
     # repeat initial library across agents
     libraries = jnp.tile(initial_library[None, ...], (n_agents, 1, 1))
     energies = jnp.zeros(n_agents, dtype=jnp.float32)
-    carry = (key, libraries, energies, histories)
+    q_vals = 10 * jnp.ones(
+        (n_agents, 2), dtype=jnp.float32
+    )  # optimistic initial values to encourage exploration
+    carry = (key, libraries, energies, histories, q_vals)
 
     carry, metrics = jax.lax.scan(body_fn, carry, jnp.arange(T))
     (
@@ -651,7 +709,7 @@ def run_simulation_loop(
         success_rates,
         library_sizes,
         library_complexities,
-        innov_returns,
+        q_vals,
         diversities,
     ) = metrics
 
@@ -661,7 +719,7 @@ def run_simulation_loop(
         success_rates,
         library_sizes,
         library_complexities,
-        innov_returns,
+        q_vals,
         diversities,
     )
 
@@ -669,7 +727,7 @@ def run_simulation_loop(
 key = jax.random.PRNGKey(0)
 max_level = 10
 plants = pregenerate_plants(key, num_per_level=100, max_level=max_level)
-n_agents, n_forage, T = 10, 10, 1000
+n_agents, n_forage, T = 50, 10, 1000
 
 start_time = time.time()
 (
@@ -678,14 +736,11 @@ start_time = time.time()
     success_rates,
     library_sizes,
     library_complexities,
-    innov_returns,
+    q_vals,
     diversities,
 ) = jax.block_until_ready(run_simulation_loop(key, plants, n_agents, T, n_forage))
 elapsed_time = time.time() - start_time
 print(f"Simulation completed in {elapsed_time:.2f} seconds.")
-
-num_innovations = jnp.cumsum((innov_returns > 0).astype(jnp.int32), axis=0)
-print(num_innovations.shape)
 
 # compute moving averages
 window_size = 50
@@ -702,7 +757,6 @@ moving_average = jax.vmap(single_agent_ma, in_axes=1, out_axes=1)
 t_ma = jnp.arange(T - window_size + 1)
 yields_ma = moving_average(yields)
 success_rates_ma = moving_average(success_rates)
-innov_returns_ma = moving_average(innov_returns)
 
 df = []
 for m in range(n_agents):
@@ -717,12 +771,17 @@ for m in range(n_agents):
                 "success_rate": float(success_rates_ma[t, m]),
                 "library_size": int(library_sizes[t, m]),
                 "library_complexity": float(library_complexities[t, m]),
-                "innov_return": float(innov_returns_ma[t, m]),
-                "num_innovations": int(num_innovations[t, m]),
                 "diversity": float(diversities[t]),
+                "q_innovate": float(q_vals[t, m, 0]),
+                "q_imitate": float(q_vals[t, m, 1]),
             }
         )
 df = pd.DataFrame(df)
+
+p_innov = np.exp(df["q_innovate"] / 1.0)
+p_imit = np.exp(df["q_imitate"] / 1.0)
+df["p_innovate"] = p_innov / (p_innov + p_imit)
+df["p_imitate"] = p_imit / (p_innov + p_imit)
 
 for hue in ["agent", None]:
     palette = "crest" if hue else None
@@ -764,25 +823,25 @@ for hue in ["agent", None]:
 
     sns.lineplot(
         df,
-        x="t_ma",
-        y="innov_return",
+        x="t",
+        y="p_innovate",
         hue=hue,
         ax=axs[4],
         legend=False,
         palette=palette,
     )
-    axs[4].set_title("Expected return of innovation")
+    axs[4].set_title("Probability of innovating")
 
     sns.lineplot(
         df,
         x="t",
-        y="num_innovations",
+        y="p_imitate",
         hue=hue,
         ax=axs[5],
         legend=False,
         palette=palette,
     )
-    axs[5].set_title("Total number of innovations")
+    axs[5].set_title("Probability of imitating")
 
     for ax in axs:
         sns.despine(ax=ax, left=True, bottom=True)
