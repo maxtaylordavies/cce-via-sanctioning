@@ -3,12 +3,8 @@ import time
 
 import jax
 import jax.numpy as jnp
-import seaborn as sns
-import matplotlib.pyplot as plt
 import pandas as pd
 import numpy as np
-
-sns.set_style("whitegrid")
 
 # --- 1. Vocabulary ---
 PAD, N, A, B, C = 0, 1, 2, 3, 4
@@ -510,57 +506,32 @@ def compute_population_jaccard(libraries):
         mean_dist: Scalar float representing the average diversity.
         dist_matrix: The full (N, N) distance matrix.
     """
-    N_AGENTS, L, R = libraries.shape
+    n_agents, library_size, _ = libraries.shape
 
-    def single_pair_jaccard(lib1, lib2):
-        # 1. Identify valid recipes (ignore empty padding)
-        # A recipe is valid if it contains at least one non-zero token
-        valid1 = jnp.any(lib1 != 0, axis=-1)
-        valid2 = jnp.any(lib2 != 0, axis=-1)
+    # Identify non-empty recipes and deduplicate within each library by keeping
+    # only the first occurrence of each recipe, matching the previous semantics.
+    valid = jnp.any(libraries != PAD, axis=-1)
+    self_matches = jnp.all(
+        libraries[:, :, None, :] == libraries[:, None, :, :], axis=-1
+    )
+    first_occurrence = jnp.arange(library_size)[None, :] == jnp.argmax(
+        self_matches, axis=2
+    )
+    unique_mask = valid & first_occurrence
+    unique_sizes = jnp.sum(unique_mask, axis=1)
 
-        # 2. Handle duplicates WITHIN each library (emulating a Set)
-        # self_matches[x, y] is True if lib[x] == lib[y]
-        self_matches1 = jnp.all(lib1[:, None, :] == lib1[None, :, :], axis=-1)
-        self_matches2 = jnp.all(lib2[:, None, :] == lib2[None, :, :], axis=-1)
+    # Pairwise recipe equality across the full population.
+    pair_matches = jnp.all(
+        libraries[:, None, :, None, :] == libraries[None, :, None, :, :], axis=-1
+    )
+    in_other_library = jnp.any(pair_matches & valid[None, :, None, :], axis=3)
+    intersections = jnp.sum(unique_mask[:, None, :] & in_other_library, axis=2)
 
-        # argmax returns the *first* index of the maximum value (True).
-        # This acts as a deduplicator: it only flags the first time a recipe appears.
-        is_first1 = jnp.arange(L) == jnp.argmax(self_matches1, axis=1)
-        is_first2 = jnp.arange(L) == jnp.argmax(self_matches2, axis=1)
+    unions = unique_sizes[:, None] + unique_sizes[None, :] - intersections
+    dist_matrix = jnp.where(unions == 0, 0.0, 1.0 - (intersections / unions))
 
-        # The actual "Set" sizes for each agent
-        set1_mask = valid1 & is_first1
-        set2_mask = valid2 & is_first2
-        size1 = jnp.sum(set1_mask)
-        size2 = jnp.sum(set2_mask)
-
-        # 3. Find intersection BETWEEN libraries
-        # matches[x, y] is True if lib1[x] == lib2[y]
-        matches = jnp.all(lib1[:, None, :] == lib2[None, :, :], axis=-1)
-
-        # A unique recipe in lib1 is in lib2 if it matches ANY valid recipe in lib2
-        in_lib2 = jnp.any(matches & valid2[None, :], axis=1)
-
-        intersection = jnp.sum(set1_mask & in_lib2)
-        union = size1 + size2 - intersection
-
-        # 4. Calculate Jaccard Distance (1 - similarity)
-        # Using jnp.where avoids division by zero if both libraries are completely empty
-        jaccard_dist = jnp.where(union == 0, 0.0, 1.0 - (intersection / union))
-        return jaccard_dist
-
-    # 5. Vectorize across the population
-    # vmap across lib2, keeping lib1 fixed
-    vmap_lib2 = jax.vmap(single_pair_jaccard, in_axes=(None, 0))
-
-    # vmap across lib1 to generate the full N x N matrix
-    vmap_all = jax.vmap(vmap_lib2, in_axes=(0, None))
-
-    dist_matrix = vmap_all(libraries, libraries)
-
-    # 6. Compute mean of the upper triangle
-    # (We ignore self-comparisons on the diagonal where distance is 0)
-    num_pairs = N_AGENTS * (N_AGENTS - 1) / 2
+    # Compute mean of the upper triangle (ignoring the diagonal).
+    num_pairs = n_agents * (n_agents - 1) / 2
     upper_tri = jnp.triu(dist_matrix, k=1)
     mean_dist = jnp.sum(upper_tri) / num_pairs
 
@@ -605,9 +576,9 @@ def run_simulation_loop(
 
         def do_innovate(_):
             innov_keys = jax.random.split(key, n_innov_attempts)
-            candidate_libraries = jax.vmap(
-                lambda k: innovate(k, libraries[agent_idx])
-            )(innov_keys)
+            candidate_libraries = jax.vmap(lambda k: innovate(k, libraries[agent_idx]))(
+                innov_keys
+            )
             yields = jax.vmap(lambda lib: evaluate_library(hist, lib)[0])(
                 candidate_libraries
             )
@@ -799,77 +770,4 @@ df["p_innovate"] = p_innov / (p_innov + p_imit)
 df["p_imitate"] = p_imit / (p_innov + p_imit)
 
 # save df
-df.to_csv("simulation_data_after_changes.csv", index=False)
-
-for hue in ["agent", None]:
-    palette = "crest" if hue else None
-
-    fig, axs = plt.subplots(2, 3, figsize=(13, 7), sharex=True)
-    axs = axs.flatten()
-
-    sns.lineplot(
-        df, x="t", y="energy", hue=hue, ax=axs[0], legend=False, palette=palette
-    )
-    axs[0].set_title("Energy")
-
-    sns.lineplot(
-        df, x="t_ma", y="yield", hue=hue, ax=axs[1], legend=False, palette=palette
-    )
-    axs[1].set_title("Average yield")
-
-    sns.lineplot(
-        df,
-        x="t_ma",
-        y="success_rate",
-        hue=hue,
-        ax=axs[2],
-        legend=False,
-        palette=palette,
-    )
-    axs[2].set_title("Success rate")
-
-    sns.lineplot(
-        df,
-        x="t",
-        y="library_complexity",
-        hue=hue,
-        ax=axs[3],
-        legend=False,
-        palette=palette,
-    )
-    axs[3].set_title("Library complexity")
-
-    sns.lineplot(
-        df,
-        x="t",
-        y="p_innovate",
-        hue=hue,
-        ax=axs[4],
-        legend=False,
-        palette=palette,
-    )
-    axs[4].set_title("Probability of innovating")
-
-    sns.lineplot(
-        df,
-        x="t",
-        y="p_imitate",
-        hue=hue,
-        ax=axs[5],
-        legend=False,
-        palette=palette,
-    )
-    axs[5].set_title("Probability of imitating")
-
-    for ax in axs:
-        sns.despine(ax=ax, left=True, bottom=True)
-
-    plt.tight_layout()
-    fig.savefig(f"figures/simulation_plots_{'per_agent' if hue else 'pop_average'}.png")
-
-fig, ax = plt.subplots()
-sns.lineplot(df, x="t", y="diversity", ax=ax)
-ax.set_title("Population diversity (mean pairwise Jaccard distance)")
-sns.despine(ax=ax, left=True, bottom=True)
-plt.tight_layout()
-fig.savefig("figures/simulation_plots_diversity.png")
+df.to_csv("simulation_data.csv", index=False)
