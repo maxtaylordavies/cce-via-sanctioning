@@ -6,198 +6,53 @@ import jax.numpy as jnp
 import pandas as pd
 import numpy as np
 
-# --- 1. Vocabulary ---
-PAD, N, A, B, C = 0, 1, 2, 3, 4
-VOCAB = [PAD, N, A, B, C]
-VOCAB_JNP = jnp.array(VOCAB, dtype=jnp.int32)
-
-# --- 2. The Environment's "Reverse" Rules ---
-# Each key is a token, and the value is a list of possible expansions.
-REVERSE_RULES = {
-    N: [[A, N, B]],  # Wrap nutrient in soft shell and fiber
-    A: [[C, C]],  # Harden the soft shell
-    B: [[B, B], [C, B]],  # Thicken the fiber, or add hard nodules to it
-}
-
-# JIT-safe rule tables derived from REVERSE_RULES.
-MAX_RULES_PER_TOKEN = max(len(REVERSE_RULES.get(token, [])) for token in VOCAB)
-MAX_EXPANSION_LEN = max(
-    [
-        len(expansion)
-        for expansions in REVERSE_RULES.values()
-        for expansion in expansions
-    ]
+from grammar import (
+    PAD,
+    MAX_LIBRARY_SIZE,
+    MAX_RECIPE_LEN,
+    MAX_PLANT_LEN,
+    MAX_RULE_LEN,
+    MAX_COMPLEXITY_LEVEL,
+    GOAL_PLANT,
+    pregenerate_plants,
+    atomic_rules,
+    initial_library,
 )
-MAX_RULE_LEN = MAX_EXPANSION_LEN
-MAX_PLANT_LEN = 30
-MAX_RECIPE_LEN = 10
-MAX_LIBRARY_SIZE = 50
-MAX_ENERGY = 200
+
+MAX_ENERGY = 500
 BASE_YIELD = 1.0
 BACKGROUND_ENERGY_LOSS = 0.5
 
-GOAL_PLANT = jnp.zeros(MAX_PLANT_LEN, dtype=jnp.int32).at[0].set(N)
-
-_rule_lengths = []
-_rule_tokens = []
-for token in VOCAB:
-    expansions = REVERSE_RULES.get(token, [])
-    lengths = [len(expansion) for expansion in expansions]
-    padded_expansions = [
-        expansion + [PAD] * (MAX_EXPANSION_LEN - len(expansion))
-        for expansion in expansions
-    ]
-
-    pad_rules = MAX_RULES_PER_TOKEN - len(expansions)
-    lengths += [0] * pad_rules
-    padded_expansions += [[PAD] * MAX_EXPANSION_LEN] * pad_rules
-
-    _rule_lengths.append(lengths)
-    _rule_tokens.append(padded_expansions)
-
-RULE_LENGTHS = jnp.array(_rule_lengths, dtype=jnp.int32)
-RULE_TOKENS = jnp.array(_rule_tokens, dtype=jnp.int32)
-HAS_REVERSE_RULES = jnp.array(
-    [token in REVERSE_RULES for token in VOCAB], dtype=jnp.float32
-)
-
-
-# construct initial recipe library from atomic forward rules
-atomic_rules = [jnp.zeros((2, MAX_RULE_LEN), dtype=jnp.int32)]
-initial_library = jnp.zeros((MAX_LIBRARY_SIZE, MAX_RECIPE_LEN), dtype=jnp.int32)
-zeros, counter = jnp.zeros(MAX_RULE_LEN, dtype=jnp.int32), 0
-for k, vs in REVERSE_RULES.items():
-    rule_result = zeros.at[0].set(k)
-    for v in vs:
-        rule_target = zeros.at[: len(v)].set(v)
-
-        rule = jnp.stack([rule_target, rule_result], axis=0)
-        atomic_rules.append(rule)
-
-        initial_library = initial_library.at[counter, 0].set(counter + 1)
-        counter += 1
-atomic_rules = jnp.stack(atomic_rules, axis=0)
-
-
-@partial(jax.jit, static_argnames=["complexity_level"])
-def generate_plant(key, complexity_level):
-    plant = jnp.zeros(MAX_PLANT_LEN, dtype=jnp.int32).at[0].set(N)  # Start with just N
-    actual_length = 1  # Track the actual length of the plant sans padding
-
-    def body_fn(carry, _):
-        key, plant, actual_length = carry
-        key, idx_key, rule_key = jax.random.split(key, 3)
-
-        p_idx = HAS_REVERSE_RULES[plant]
-        stop = jnp.sum(p_idx) == 0
-        p_idx = jnp.where(stop, jnp.ones_like(p_idx), p_idx)
-        p_idx /= p_idx.sum()
-
-        target_idx = jax.random.choice(idx_key, MAX_PLANT_LEN, p=p_idx)
-        target_token = plant[target_idx]
-
-        token_rule_lengths = RULE_LENGTHS[target_token]
-        valid_rule_mask = token_rule_lengths > 0
-        valid_rule_probs = valid_rule_mask.astype(jnp.float32)
-        valid_rule_probs /= valid_rule_probs.sum()
-
-        rule_idx = jax.random.choice(rule_key, MAX_RULES_PER_TOKEN, p=valid_rule_probs)
-        expansion = RULE_TOKENS[target_token, rule_idx]
-        expansion_len = token_rule_lengths[rule_idx]
-
-        # Apply the expansion (replace one token with a variable-length expansion)
-        new_positions = jnp.arange(MAX_PLANT_LEN, dtype=jnp.int32)
-
-        # Prefix positions copy directly from the original plant.
-        src_prefix = new_positions
-
-        # Expansion region sources from expansion[] using target-relative offsets.
-        src_expansion = new_positions - target_idx
-
-        # Tail shifts right by (expansion_len - 1) after replacing one token.
-        src_tail = new_positions - (expansion_len - 1)
-
-        in_prefix = new_positions < target_idx
-        in_expansion = (new_positions >= target_idx) & (
-            new_positions < (target_idx + expansion_len)
-        )
-
-        src_idx = jnp.where(in_prefix, src_prefix, src_tail)
-        src_idx = jnp.clip(src_idx, 0, MAX_PLANT_LEN - 1)
-        copied = plant[src_idx]
-
-        expansion_idx = jnp.clip(src_expansion, 0, MAX_EXPANSION_LEN - 1)
-        expansion_vals = expansion[expansion_idx]
-        expansion_vals = jnp.where(in_expansion, expansion_vals, PAD)
-
-        new_plant: jax.Array = jnp.where(in_expansion, expansion_vals, copied)
-
-        actual_length += expansion_len - 1
-        stop: jax.Array = stop | (actual_length >= MAX_PLANT_LEN)
-        plant: jax.Array = jnp.where(stop, plant, new_plant)
-
-        return (key, plant, actual_length), None
-
-    carry = (key, plant, actual_length)
-    carry, _ = jax.lax.scan(body_fn, carry, jnp.arange(complexity_level))
-    _, plant, _ = carry
-    return plant
-
-
-def pregenerate_plants(key, num_per_level, max_level):
-    plants = jnp.zeros((max_level + 1, num_per_level, MAX_PLANT_LEN), dtype=jnp.int32)
-    for cl in range(max_level + 1):
-        key, subkey = jax.random.split(key)
-        keys = jax.random.split(subkey, num_per_level)
-        tmp = jax.vmap(lambda k: generate_plant(k, cl))(keys)
-        plants = plants.at[cl].set(tmp)
-    return plants
+ROLE_INNOVATE, ROLE_IMITATE = 0, 1
 
 
 @partial(jax.jit, static_argnames=["max_level", "n"])
 def forage(key, plants, energy, max_level, n):
-    curr_max_level_idx = jnp.floor((energy / (MAX_ENERGY + 1)) * max_level).astype(
-        jnp.int32
-    )
-
-    # Uniform over levels [1 .. curr_max_level_idx], zero otherwise.
-    # p_level_idx indexes levels 1..max_level (length max_level).
-    idx = jnp.arange(max_level, dtype=jnp.int32)
-    active = idx <= curr_max_level_idx
-
-    # uniform over active levels
-    p_level_idx = active.astype(jnp.float32)
-    p_level_idx /= p_level_idx.sum()
-
-    # small bias toward the current max level
-    # max active level index in 0-based space:
-    bias_bonus = 0.20  # tune this (e.g. 0.05 to 0.20)
-    p_level_idx = p_level_idx.at[curr_max_level_idx].add(bias_bonus)
-
-    # renormalize
-    p_level_idx = p_level_idx / p_level_idx.sum()
-
-    def single(key):
-        key_level, key_plant = jax.random.split(key)
-        level = jax.random.choice(key_level, max_level, p=p_level_idx) + 1
-        plant = jax.random.choice(key_plant, plants[level], axis=0)
-        return plant, level
-
-    plants_out, levels = jax.vmap(single)(jax.random.split(key, n))
+    level = 1 + jnp.floor((energy / MAX_ENERGY) * max_level)
+    level = jnp.clip(level, 1, max_level).astype(jnp.int32)
+    plants_out = jax.random.choice(key, plants[level], shape=(n,), axis=0)
+    levels = jnp.full((n,), level, dtype=jnp.int32)
     return plants_out, levels
 
 
 @jax.jit
-def update_forage_history(history, new_foraged):
-    history_len = history.shape[0]
-    history = (
-        jnp.zeros_like(history)
+def update_forage_history(plant_history, level_history, new_plants, new_levels):
+    history_len = plant_history.shape[0]
+    plant_history = (
+        jnp.zeros_like(plant_history)
         .at[: history_len - 1]
-        .set(history[1:])
+        .set(plant_history[1:])
         .at[-1]
-        .set(new_foraged)
+        .set(new_plants)
     )
-    return history
+    level_history = (
+        jnp.zeros_like(level_history)
+        .at[: history_len - 1]
+        .set(level_history[1:])
+        .at[-1]
+        .set(new_levels)
+    )
+    return plant_history, level_history
 
 
 @jax.jit
@@ -294,12 +149,13 @@ def apply_recipe(plant, recipe):
 
 
 @jax.jit
-def evaluate_library(plants, library, rule_cost=0.01):
+def evaluate_library(plants, levels, library, rule_cost=0.05):
     """
     Evaluates a library of recipes on a batch of plants.
 
     Args:
         plants: jnp.ndarray[int32] shape (batch_size, MAX_PLANT_LEN), PAD-terminated.
+        levels: jnp.ndarray[int32] shape (batch_size,), complexity levels for each plant.
         library: jnp.ndarray[int32] shape (num_recipes, num_rules, 2, MAX_RULE_LEN), where each recipe is a sequence of [target, replacement] stacked and PAD-terminated.
 
     Returns:
@@ -308,15 +164,14 @@ def evaluate_library(plants, library, rule_cost=0.01):
 
     recipe_lengths = jnp.sum(library != PAD, axis=1)
 
-    def eval_single_plant(plant):
+    def eval_single_plant(plant, level):
         processed = jax.vmap(lambda recipe: apply_recipe(plant, recipe))(library)
 
         # determine if each processed plant matches the goal plant
         successes = jnp.all(processed == GOAL_PLANT, axis=1)
 
-        # scale successful yields by original plant complexity (number of non-PAD tokens)
-        plant_length = jnp.sum(plant != PAD)
-        yields = successes.astype(jnp.float32) * BASE_YIELD * plant_length
+        # scale successful yields by original plant complexity
+        yields = successes.astype(jnp.float32) * BASE_YIELD * level
 
         # calculate the actual length of each recipe (number of non-PAD rules)
         yields -= rule_cost * recipe_lengths  # penalize longer recipes
@@ -324,7 +179,7 @@ def evaluate_library(plants, library, rule_cost=0.01):
         yields = jnp.maximum(yields, 0.0)  # ensure yields are non-negative
         return yields.max()
 
-    yields = jax.vmap(eval_single_plant)(plants)
+    yields = jax.vmap(eval_single_plant, in_axes=(0, 0))(plants, levels)
     return yields.mean(), (yields > 0).mean()  # also return success rate
 
 
@@ -339,7 +194,7 @@ def get_library_size(library):
 
 
 @jax.jit
-def get_diff_size(library_1, library_2):
+def get_size_diff(library_1, library_2):
     return (library_2 != library_1).astype(jnp.int32).sum()
 
 
@@ -443,7 +298,7 @@ def innovate(key, library):
     key_op, key_recipe = jax.random.split(key)
 
     # select which type of operation to perform: add a rule, delete a rule, or combine two recipes
-    op_probs = jnp.array([0.4, 0.4, 0.2])  # probabilities for add, delete, combine
+    op_probs = jnp.ones(3) / 3  # probabilities for add, delete, combine
     op = jax.random.choice(key_op, 3, p=op_probs)
 
     # sample recipe(s) from the library to modify
@@ -559,57 +414,90 @@ def run_simulation_loop(
         lambda k, e: forage(k, plants, e, max_level, n_forage), in_axes=(0, 0)
     )
 
-    # (histories, foraged_plants) -> updated_histories
-    vmapped_update_history = jax.vmap(update_forage_history, in_axes=(0, 0))
+    # (plant_histories, level_histories, foraged_plants, foraged_levels) -> updated_histories
+    vmapped_update_history = jax.vmap(update_forage_history, in_axes=(0, 0, 0, 0))
 
-    # (foraged_plants, libraries) -> avg yields, success_rates
-    vmapped_eval_library = jax.vmap(evaluate_library, in_axes=(0, 0))
-
-    # (old libraries, new libraries) -> diff sizes
-    vmapped_get_diff_size = jax.vmap(get_diff_size, in_axes=(0, 0))
+    # (foraged_plants, levels, libraries) -> avg yields, success_rates
+    vmapped_eval_library = jax.vmap(evaluate_library, in_axes=(0, 0, 0))
 
     @jax.jit
-    def update_library(key, agent_idx, libraries, histories, roles):
+    def update_library(
+        key,
+        agent_idx,
+        libraries,
+        plant_histories,
+        level_histories,
+        roles,
+        innov_cost,
+        imit_cost,
+    ):
+        # ROLE KEY: 0 = innovate, 1 = imitate
+
         # compute avg yield of current library over n-step history
-        hist = histories[agent_idx].reshape(-1, MAX_PLANT_LEN)
-        curr_yield = evaluate_library(hist, libraries[agent_idx])[0]
+        plant_hist = plant_histories[agent_idx].reshape(-1, MAX_PLANT_LEN)
+        level_hist = level_histories[agent_idx].reshape(-1)
+        curr_yield = evaluate_library(plant_hist, level_hist, libraries[agent_idx])[0]
 
         def do_innovate(_):
             innov_keys = jax.random.split(key, n_innov_attempts)
             candidate_libraries = jax.vmap(lambda k: innovate(k, libraries[agent_idx]))(
                 innov_keys
             )
-            yields = jax.vmap(lambda lib: evaluate_library(hist, lib)[0])(
-                candidate_libraries
-            )
+            yields = jax.vmap(
+                lambda lib: evaluate_library(plant_hist, level_hist, lib)[0]
+            )(candidate_libraries)
             best_innov_idx = yields.argmax()
             return candidate_libraries[best_innov_idx], yields[best_innov_idx]
 
         def do_imitate(_):
             imitation_library = imitate_recipe(key, libraries, agent_idx, n_agents)
-            imitation_yield = evaluate_library(hist, imitation_library)[0]
+            imitation_yield = evaluate_library(
+                plant_hist, level_hist, imitation_library
+            )[0]
             return imitation_library, imitation_yield
 
+        # obtain new library (and corresponding yield) based on chosen role
         new_library, new_yield = jax.lax.cond(
-            roles[agent_idx] == 0,
+            roles[agent_idx] == ROLE_INNOVATE,
             do_innovate,
             do_imitate,
             operand=None,
         )
 
-        return new_library, curr_yield, new_yield
+        # compute cost of update based on role
+        cost = jax.lax.switch(
+            roles[agent_idx],
+            [
+                lambda: innov_cost * get_size_diff(libraries[agent_idx], new_library),
+                lambda: imit_cost,
+            ],
+        )
 
-    # (keys, libraries, histories) -> updated_libraries, innov_returns
-    vmapped_update_library = jax.vmap(update_library, in_axes=(0, 0, None, None, None))
+        # adopt new library if it improves yield
+        yield_delta = new_yield - curr_yield
+        new_library = jnp.where(yield_delta > 0, new_library, libraries[agent_idx])
+        yield_delta = jnp.where(yield_delta > 0, yield_delta, 0.0)
 
-    # (libraries) -> library_sizes
-    vmapped_get_library_size = jax.vmap(get_library_size)
+        return new_library, yield_delta, cost
+
+    # (keys, agent_idxs, libraries, plant_histories, level_histories, roles, innov_cost, imit_cost) -> updated_libraries, yield_deltas, costs
+    vmapped_update_library = jax.vmap(
+        update_library, in_axes=(0, 0, None, None, None, None, None, None)
+    )
 
     # (libraries) -> library_entropies
     vmapped_get_library_entropy = jax.vmap(get_library_entropy)
 
     def body_fn(carry, t):
-        key, libraries, energies, histories, q_vals, prev_diversity = carry
+        (
+            key,
+            libraries,
+            energies,
+            plant_histories,
+            level_histories,
+            q_vals,
+            prev_diversity,
+        ) = carry
 
         # get new keys
         key, forage_key, policy_key, innov_key = jax.random.split(key, 4)
@@ -617,32 +505,39 @@ def run_simulation_loop(
         innov_keys = jax.random.split(innov_key, n_agents)
 
         # each agent forages a batch of plants based on their current energy level
-        foraged, _ = vmapped_forage(forage_keys, energies)
+        foraged_plants, foraged_levels = vmapped_forage(forage_keys, energies)
 
         # update each agent's forage history with new batch
-        histories = vmapped_update_history(histories, foraged)
-
-        # process each agent's foraged batch with their current library, then update their energy based on yield
-        avg_yields, success_rates = vmapped_eval_library(foraged, libraries)
-        energies = jnp.clip(
-            energies + avg_yields - BACKGROUND_ENERGY_LOSS, 0, MAX_ENERGY
+        plant_histories, level_histories = vmapped_update_history(
+            plant_histories, level_histories, foraged_plants, foraged_levels
         )
+
+        # process each agent's foraged batch with their current library
+        avg_yields, _ = vmapped_eval_library(foraged_plants, foraged_levels, libraries)
 
         # each agent chooses a role based on their q-values
         role_probs = jax.nn.softmax(q_vals / choice_beta, axis=1)
         roles = jax.random.categorical(policy_key, jnp.log(role_probs), axis=1)
 
         # each agent updates their library based on their chosen role
-        new_libraries, curr_yields, new_yields = vmapped_update_library(
-            innov_keys, jnp.arange(n_agents), libraries, histories, roles
+        new_libraries, yield_deltas, costs = vmapped_update_library(
+            innov_keys,
+            jnp.arange(n_agents),
+            libraries,
+            plant_histories,
+            level_histories,
+            roles,
+            innov_cost,
+            imit_cost,
         )
 
-        # compute rewards for each agent based on yield improvement and innovation/imitation costs
-        size_deltas = vmapped_get_diff_size(libraries, new_libraries)
-        costs = jnp.where(roles == 0, innov_cost * size_deltas, imit_cost)
-        rewards = (new_yields - curr_yields) - costs
+        # update each agent's energy
+        energies = jnp.clip(
+            energies + avg_yields - costs - BACKGROUND_ENERGY_LOSS, 0, MAX_ENERGY
+        )
 
-        # update q-values with a simple reward prediction error rule
+        # update q-values based on reward prediction error
+        rewards = yield_deltas - costs
         rpe = rewards - q_vals[jnp.arange(n_agents), roles]
         q_vals = q_vals.at[jnp.arange(n_agents), roles].add(learning_rate * rpe)
 
@@ -656,111 +551,80 @@ def run_simulation_loop(
             libraries,
         )
 
-        return (key, libraries, energies, histories, q_vals, pop_diversity), (
+        return (
+            key,
+            libraries,
             energies,
+            plant_histories,
+            level_histories,
+            q_vals,
+            pop_diversity,
+        ), (
+            energies,
+            foraged_levels.mean(axis=1),
             avg_yields,
-            success_rates,
-            vmapped_get_library_size(libraries),
             vmapped_get_library_entropy(libraries),
             q_vals,
             pop_diversity,
         )
 
-    histories = jnp.zeros(
+    plant_histories = jnp.zeros(
         (n_agents, history_len, n_forage, MAX_PLANT_LEN), dtype=jnp.int32
     )
-    # repeat initial library across agents
+    level_histories = jnp.zeros((n_agents, history_len, n_forage), dtype=jnp.int32)
     libraries = jnp.tile(initial_library[None, ...], (n_agents, 1, 1))
     energies = jnp.zeros(n_agents, dtype=jnp.float32)
-    q_vals = 10 * jnp.ones(
+    q_vals = 10.0 * jnp.ones(
         (n_agents, 2), dtype=jnp.float32
-    )  # optimistic initial values to encourage exploration
+    )  # optimistic initial values for innovate and imitate
+
     init_diversity, _ = compute_population_jaccard(libraries)
-    carry = (key, libraries, energies, histories, q_vals, init_diversity)
+    carry = (
+        key,
+        libraries,
+        energies,
+        plant_histories,
+        level_histories,
+        q_vals,
+        init_diversity,
+    )
 
     carry, metrics = jax.lax.scan(body_fn, carry, jnp.arange(T))
-    (
-        energies,
-        yields,
-        success_rates,
-        library_sizes,
-        library_complexities,
-        q_vals,
-        diversities,
-    ) = metrics
-
-    return (
-        energies,
-        yields,
-        success_rates,
-        library_sizes,
-        library_complexities,
-        q_vals,
-        diversities,
-    )
+    return metrics
 
 
 key = jax.random.PRNGKey(0)
-max_level = 10
-plants = pregenerate_plants(key, num_per_level=100, max_level=max_level)
-n_agents, n_forage, T = 20, 10, 1000
+plants = pregenerate_plants(key, num_per_level=500, max_level=MAX_COMPLEXITY_LEVEL)
+n_agents, n_forage, T = 5, 10, 200
 
 start_time = time.time()
-(
-    energies,
-    yields,
-    success_rates,
-    library_sizes,
-    library_complexities,
-    q_vals,
-    diversities,
-) = jax.block_until_ready(run_simulation_loop(key, plants, n_agents, T, n_forage))
+(energies, foraged_levels, yields, library_complexities, q_vals, diversities) = (
+    jax.block_until_ready(run_simulation_loop(key, plants, n_agents, T, n_forage))
+)
 elapsed_time = time.time() - start_time
 print(f"Simulation completed in {elapsed_time:.2f} seconds.")
 
-# compute moving averages
-window_size = 50
-
-
-def single_agent_ma(x):
-    cumsum = jnp.cumsum(jnp.insert(x, 0, 0))
-    return (cumsum[window_size:] - cumsum[:-window_size]) / window_size
-
-
-moving_average = jax.vmap(single_agent_ma, in_axes=1, out_axes=1)
-
-
-t_ma = jnp.arange(T - window_size + 1)
+# construct dataframe
+start_time = time.time()
+single_agent_ma = lambda x: pd.Series(x).rolling(window=20, min_periods=1).mean().values
+moving_average = np.vectorize(single_agent_ma, signature="(t)->(t)")
 yields_ma = moving_average(yields)
-success_rates_ma = moving_average(success_rates)
 
 sample_ts = np.arange(0, T, 10)
 flat_a = np.repeat(np.arange(n_agents), sample_ts.size)
 flat_t = np.tile(sample_ts, n_agents)
-t_ma_idx = np.minimum(flat_t, T - window_size)
-
-energies_np = np.asarray(energies, dtype=np.float64)
-yields_ma_np = np.asarray(yields_ma, dtype=np.float64)
-success_rates_ma_np = np.asarray(success_rates_ma, dtype=np.float64)
-library_sizes_np = np.asarray(library_sizes)
-library_complexities_np = np.asarray(library_complexities, dtype=np.float64)
-diversities_np = np.asarray(diversities, dtype=np.float64)
-q_vals_np = np.asarray(q_vals, dtype=np.float64)
-t_ma_np = np.asarray(t_ma)
 
 df = pd.DataFrame(
     {
         "agent": flat_a,
         "t": flat_t,
-        "t_ma": t_ma_np[t_ma_idx],
-        "energy": energies_np[flat_t, flat_a],
-        "yield": yields_ma_np[t_ma_idx, flat_a],
-        "success_rate": success_rates_ma_np[t_ma_idx, flat_a],
-        "library_size": library_sizes_np[flat_t, flat_a],
-        "library_complexity": library_complexities_np[flat_t, flat_a],
-        "diversity": diversities_np[flat_t],
-        "q_innovate": q_vals_np[flat_t, flat_a, 0],
-        "q_imitate": q_vals_np[flat_t, flat_a, 1],
+        "energy": energies[flat_t, flat_a],
+        "yield": yields_ma[flat_t, flat_a],
+        "foraged_level": foraged_levels[flat_t, flat_a],
+        "library_complexity": library_complexities[flat_t, flat_a],
+        "diversity": diversities[flat_t],
+        "q_innovate": q_vals[flat_t, flat_a, ROLE_INNOVATE],
+        "q_imitate": q_vals[flat_t, flat_a, ROLE_IMITATE],
     }
 )
 
@@ -768,6 +632,9 @@ p_innov = np.exp(df["q_innovate"] / 1.0)
 p_imit = np.exp(df["q_imitate"] / 1.0)
 df["p_innovate"] = p_innov / (p_innov + p_imit)
 df["p_imitate"] = p_imit / (p_innov + p_imit)
+
+elapsed_time = time.time() - start_time
+print(f"Dataframe construction completed in {elapsed_time:.2f} seconds.")
 
 # save df
 df.to_csv("simulation_data.csv", index=False)

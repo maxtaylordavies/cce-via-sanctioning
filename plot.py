@@ -5,13 +5,14 @@ import pandas as pd
 sns.set_style("whitegrid")
 
 df = pd.read_csv("simulation_data.csv")
-
 df = df[df["t"] % 10 == 0]
 
 for hue in ["agent", None]:
     kwargs = {"legend": False}
     if hue:
         kwargs = {**kwargs, "hue": hue, "palette": "crest", "alpha": 0.5}
+    else:
+        kwargs = {**kwargs, "color": "black"}
 
     fig, axs = plt.subplots(2, 3, figsize=(13, 7), sharex=True)
     axs = axs.flatten()
@@ -19,11 +20,11 @@ for hue in ["agent", None]:
     sns.lineplot(df, x="t", y="energy", ax=axs[0], **kwargs)
     axs[0].set_title("Energy")
 
-    sns.lineplot(df, x="t_ma", y="yield", ax=axs[1], **kwargs)
-    axs[1].set_title("Average yield")
+    sns.lineplot(df, x="t", y="foraged_level", ax=axs[1], **kwargs)
+    axs[1].set_title("Average level of foraged plants")
 
-    sns.lineplot(df, x="t_ma", y="success_rate", ax=axs[2], **kwargs)
-    axs[2].set_title("Success rate")
+    sns.lineplot(df, x="t", y="yield", ax=axs[2], **kwargs)
+    axs[2].set_title("Average yield")
 
     sns.lineplot(df, x="t", y="library_complexity", ax=axs[3], **kwargs)
     axs[3].set_title("Library complexity")
