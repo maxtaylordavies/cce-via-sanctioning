@@ -34,10 +34,12 @@ MAX_EXPANSION_LEN = max(
     ]
 )
 MAX_RULE_LEN = max(MAX_TARGET_LEN, MAX_EXPANSION_LEN)
-MAX_PLANT_LEN = 30
+MAX_PLANT_LEN = 20
 MAX_COMPLEXITY_LEVEL = 10
-MAX_RECIPE_LEN = 2 * MAX_COMPLEXITY_LEVEL
+MAX_RECIPE_LEN = MAX_COMPLEXITY_LEVEL + 5
 MAX_LIBRARY_SIZE = 50
+EMPTY_RECIPE_ID = -1
+NUM_RULES_IN_INITIAL_LIBRARY = 3
 
 GOAL_PLANT = jnp.zeros(MAX_PLANT_LEN, dtype=jnp.int32).at[0].set(N)
 
@@ -64,16 +66,17 @@ RULE_EXPANSION_LENGTHS = jnp.array(_reverse_rule_expansion_lengths, dtype=jnp.in
 # construct initial recipe library from atomic forward rules
 atomic_rules = [jnp.zeros((2, MAX_RULE_LEN), dtype=jnp.int32)]
 initial_library = jnp.zeros((MAX_LIBRARY_SIZE, MAX_RECIPE_LEN), dtype=jnp.int32)
+initial_recipe_ids = jnp.full(MAX_LIBRARY_SIZE, EMPTY_RECIPE_ID, dtype=jnp.int32)
 zeros, counter = jnp.zeros(MAX_RULE_LEN, dtype=jnp.int32), 0
 for target, expansions in REVERSE_RULES.items():
     rule_result = zeros.at[: len(target)].set(jnp.array(target, dtype=jnp.int32))
     for expansion in expansions:
         rule_target = zeros.at[: len(expansion)].set(expansion)
-
         rule = jnp.stack([rule_target, rule_result], axis=0)
         atomic_rules.append(rule)
-
-        initial_library = initial_library.at[counter, 0].set(counter + 1)
+        if counter < NUM_RULES_IN_INITIAL_LIBRARY:
+            initial_library = initial_library.at[counter, 0].set(counter + 1)
+            initial_recipe_ids = initial_recipe_ids.at[counter].set(counter)
         counter += 1
 atomic_rules = jnp.stack(atomic_rules, axis=0)
 

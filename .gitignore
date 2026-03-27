@@ -12,4 +12,5 @@ wheels/
 
 # Other
 figures/
-*.csv
+data/
+**/notebook.py
