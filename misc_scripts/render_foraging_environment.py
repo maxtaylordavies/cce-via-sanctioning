@@ -189,7 +189,8 @@ def render_environment(
     right_colors = [blend(color, "#0f1f10", 0.18) for color in palette]
 
     min_x, max_x, min_y, max_y = visible_bounds(cfg)
-    margin = max(cfg.tile_width, cfg.tile_height, cfg.level_height) * 1.2
+    # margin = max(cfg.tile_width, cfg.tile_height, cfg.level_height) * 0.5
+    margin = 0.1
     width = max_x - min_x + 2 * margin
     height = max_y - min_y + 2 * margin
 
@@ -315,10 +316,10 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
-        "--rows", type=int, default=20, help="Number of tile rows on the top face."
+        "--rows", type=int, default=10, help="Number of tile rows on the top face."
     )
     parser.add_argument(
-        "--cols", type=int, default=20, help="Number of tile columns on the top face."
+        "--cols", type=int, default=10, help="Number of tile columns on the top face."
     )
     parser.add_argument(
         "--max-foraging-level",
@@ -332,7 +333,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output",
         type=Path,
-        default=Path("figures/foraging_environment.png"),
+        default=Path("figures/foraging_environment.svg"),
         help="Output file path. The extension can be .svg, .png, .pdf, or another Matplotlib-supported format.",
     )
     parser.add_argument(
@@ -350,7 +351,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--level-height",
         type=float,
-        default=0.82,
+        default=1.2,
         help="Vertical size of each foraging level in projected units.",
     )
     parser.add_argument(

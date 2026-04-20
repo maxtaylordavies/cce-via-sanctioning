@@ -9,7 +9,7 @@ def weighted_mean(values, weights):
     return float(np.average(values, weights=weights))
 
 
-def save_fig(fig, filename, subfolder=None, fmts=["png"], tight=True):
+def save_fig(fig, filename, subfolder=None, fmts=["svg", "png"], tight=True):
     folder = "figures"
     if subfolder is not None:
         folder = f"{folder}/{subfolder}"

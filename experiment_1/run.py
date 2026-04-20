@@ -2,7 +2,6 @@ from functools import partial
 
 import jax
 import jax.numpy as jnp
-import pandas as pd
 import numpy as np
 from tqdm import tqdm
 

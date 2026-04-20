@@ -16,7 +16,7 @@ from grammar import (
     pregenerate_plants,
 )
 
-TOKEN_TO_COLOR = {N: "green", H: "lightblue", S: "blue", T: "purple", P: "orange"}
+TOKEN_TO_COLOR = {N: "#00A068", H: "#89D8D9", S: "#1C6897", T: "#C95B63", P: "#DF821E"}
 
 
 def plant_to_colors(plant):
@@ -183,7 +183,7 @@ def visualise_rules(
             "",
             xy=(arrow_start_x + arrow_dx, unit_size / 2),
             xytext=(arrow_start_x, unit_size / 2),
-            arrowprops={"arrowstyle": "->", "linewidth": 3, "color": "black"},
+            arrowprops={"arrowstyle": "<->", "linewidth": 3, "color": "black"},
         )
         ax.set_xlim(0, total_slots * (unit_size + link_length))
         ax.set_ylim(0, unit_size)
@@ -301,30 +301,27 @@ def visualise_recipe(recipe, unit_size=1, link_length=0.5, link_height=0.1):
     return fig, ax
 
 
-key = jax.random.PRNGKey(0)
-max_level, num_per_level = 20, 10
+key = jax.random.PRNGKey(2)
+max_level, num_per_level = 10, 10
 plants = pregenerate_plants(key, num_per_level, max_level)
 
 for level in range(1, max_level + 1):
     avg_length = (plants[level] != PAD).sum(axis=1).mean()
     print(f"Level {level}: average plant length = {avg_length:.2f}")
     fig, axs = visualise_multiple_plants(plants[level], align=False)
-    fig.savefig(f"figures/plants/level-{level}.pdf")
+    fig.savefig(f"figures/plants/level-{level}.svg")
 
-for seed in range(5):
-    key = jax.random.PRNGKey(seed)
-    plant, intermediates = generate_plant(key, complexity_level=20)
-    fig, axs = visualise_multiple_plants(intermediates)
-    fig.savefig(f"figures/plants/generation-process-seed-{seed}.png")
+# for seed in range(5):
+#     key = jax.random.PRNGKey(seed)
+#     plant, intermediates = generate_plant(key, complexity_level=10)
+#     fig, axs = visualise_multiple_plants(intermediates)
+#     fig.savefig(f"figures/plants/generation-process-seed-{seed}.svg")
 
-fig, axs = visualise_rules(REVERSE_RULES)
-fig.savefig("figures/generating_rules.pdf")
+# fig, axs = visualise_rules(REVERSE_RULES)
+# fig.savefig("figures/generating_rules.svg")
 
-fig, axs = visualise_rules(REVERSE_RULES, flip=True)
-fig.savefig("figures/processing_rules.pdf")
+# recipe_ = jnp.array([1, 2, 3, 4, 5, 6], dtype=int)
+# recipe = jnp.zeros(MAX_RECIPE_LEN, dtype=int).at[: recipe_.shape[0]].set(recipe_)
 
-recipe_ = jnp.array([1, 2, 3, 4, 5, 6], dtype=int)
-recipe = jnp.zeros(MAX_RECIPE_LEN, dtype=int).at[: recipe_.shape[0]].set(recipe_)
-
-fig, ax = visualise_recipe(recipe)
-fig.savefig("figures/recipe.pdf")
+# fig, ax = visualise_recipe(recipe)
+# fig.savefig("figures/recipe.pdf")

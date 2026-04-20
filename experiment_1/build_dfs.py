@@ -4,9 +4,7 @@ import os
 import numpy as np
 import pandas as pd
 
-from utils import weighted_mean
-
-DATA_DIR = Path("data/new")
+DATA_DIR = Path("data/experiment_1/5k")
 
 
 def get_gini(values):
@@ -17,6 +15,11 @@ def get_gini(values):
     n = values.size
     mean_abs_diff = np.abs(values[:, None] - values[None, :]).mean()
     return float(mean_abs_diff * n / (2 * total))
+
+
+def get_fee_axis_values(fees):
+    fees = np.asarray(fees, dtype=np.float64)
+    return np.round(fees, 6)
 
 
 def get_recipe_lineage_stats(
@@ -114,12 +117,87 @@ def get_recipe_age_stats(
     return memo[recipe_id]
 
 
+def get_recombination_distance_stats(
+    parent_1_id,
+    parent_2_id,
+    child_id,
+    parent_1_ids,
+    parent_2_ids,
+    creator_agent_ids,
+    birth_timesteps,
+    num_rules_in_initial_library,
+    empty_recipe_id,
+    lineage_memo,
+):
+    if parent_1_id == empty_recipe_id or parent_2_id == empty_recipe_id:
+        return {
+            "recomb_branch_distance_innov_only": np.nan,
+            "recomb_mrca_age_innov_only": np.nan,
+        }
+
+    parent_1_birth = float(birth_timesteps[parent_1_id])
+    parent_2_birth = float(birth_timesteps[parent_2_id])
+    child_birth = float(birth_timesteps[child_id])
+
+    if child_birth < 0:
+        return {
+            "recomb_branch_distance_innov_only": np.nan,
+            "recomb_mrca_age_innov_only": np.nan,
+        }
+
+    ancestor_ids_1, _ = get_recipe_lineage_stats(
+        parent_1_id,
+        parent_1_ids,
+        parent_2_ids,
+        creator_agent_ids,
+        num_rules_in_initial_library,
+        empty_recipe_id,
+        lineage_memo,
+    )
+    ancestor_ids_2, _ = get_recipe_lineage_stats(
+        parent_2_id,
+        parent_1_ids,
+        parent_2_ids,
+        creator_agent_ids,
+        num_rules_in_initial_library,
+        empty_recipe_id,
+        lineage_memo,
+    )
+
+    common_ancestor_ids = set(ancestor_ids_1).intersection(ancestor_ids_2)
+    common_births = [
+        float(birth_timesteps[ancestor_id])
+        for ancestor_id in common_ancestor_ids
+        if birth_timesteps[ancestor_id] >= 0
+    ]
+
+    if common_births:
+        mrca_birth_innov_only = max(common_births)
+    else:
+        mrca_birth_innov_only = np.nan
+
+    recomb_branch_distance_innov_only = (
+        np.nan
+        if np.isnan(mrca_birth_innov_only)
+        else (parent_1_birth - mrca_birth_innov_only)
+        + (parent_2_birth - mrca_birth_innov_only)
+    )
+
+    recomb_mrca_age_innov_only = (
+        np.nan if np.isnan(mrca_birth_innov_only) else child_birth - mrca_birth_innov_only
+    )
+
+    return {
+        "recomb_branch_distance_innov_only": recomb_branch_distance_innov_only,
+        "recomb_mrca_age_innov_only": recomb_mrca_age_innov_only,
+    }
+
+
 def summarise_recipe_lineages(
     seed,
     fee,
     libraries,
     recipe_ids,
-    agent_ids,
     parent_1_ids,
     parent_2_ids,
     creator_agent_ids,
@@ -131,10 +209,9 @@ def summarise_recipe_lineages(
 ):
     valid_recipe_ids = recipe_ids[recipe_ids != empty_recipe_id]
     if valid_recipe_ids.size == 0:
-        return [], []
+        return []
 
     lineage_rows = []
-    instance_rows = []
     memo = {}
     age_memo = {}
     valid_limit = int(next_recipe_id)
@@ -155,8 +232,8 @@ def summarise_recipe_lineages(
             memo,
         )
         (
-            recipe_birth_timestep,
-            earliest_ancestor_birth_timestep,
+            _recipe_birth_timestep,
+            _earliest_ancestor_birth_timestep,
             recipe_age,
             recipe_ancestor_age,
         ) = get_recipe_age_stats(
@@ -177,48 +254,16 @@ def summarise_recipe_lineages(
                 "seed": seed,
                 "fee": fee,
                 "recipe_id": int(recipe_id),
-                "parent_1_id": int(parent_1_ids[recipe_id]),
-                "parent_2_id": int(parent_2_ids[recipe_id]),
-                "creator_agent_id": int(creator_agent_ids[recipe_id]),
                 "n_innovation_events": len(innovation_event_ids),
                 "n_unique_innovators": len(innovator_ids),
                 "n_copies": int(n_copies),
                 "recipe_length": recipe_length,
-                "recipe_birth_timestep": recipe_birth_timestep,
-                "earliest_ancestor_birth_timestep": earliest_ancestor_birth_timestep,
                 "recipe_age": recipe_age,
                 "recipe_ancestor_age": recipe_ancestor_age,
             }
         )
 
-    for agent_idx in range(recipe_ids.shape[0]):
-        for slot_idx in range(recipe_ids.shape[1]):
-            recipe_id = int(recipe_ids[agent_idx, slot_idx])
-            if recipe_id == empty_recipe_id:
-                continue
-            innovation_event_ids, innovator_ids = get_recipe_lineage_stats(
-                recipe_id,
-                parent_1_ids,
-                parent_2_ids,
-                creator_agent_ids,
-                num_rules_in_initial_library,
-                empty_recipe_id,
-                memo,
-            )
-            instance_rows.append(
-                {
-                    "seed": seed,
-                    "fee": fee,
-                    "agent_idx": agent_idx,
-                    "agent_id": int(agent_ids[agent_idx]),
-                    "slot_idx": slot_idx,
-                    "recipe_id": recipe_id,
-                    "n_innovation_events": len(innovation_event_ids),
-                    "n_unique_innovators": len(innovator_ids),
-                }
-            )
-
-    return lineage_rows, instance_rows
+    return lineage_rows
 
 
 def build_population_df(outputs):
@@ -227,15 +272,12 @@ def build_population_df(outputs):
     t_main = int(outputs["T_main"])
     agent_levels = outputs["agent_levels"]
     agent_yields = outputs["agent_yields"]
-    agent_lib_entropies = outputs["agent_lib_entropies"]
     pop_role_rewards = outputs["pop_role_rewards"]
-    pop_diversities = outputs["pop_diversities"]
     agent_roles = outputs["agent_roles"]
     role_innovate = int(outputs["role_innovate"])
 
     pop_levels = agent_levels.mean(axis=3)
     pop_yields = agent_yields.mean(axis=3)
-    pop_lib_entropies = agent_lib_entropies.mean(axis=3)
     pop_prop_innovs = (agent_roles == role_innovate).mean(axis=3)
     pop_yield_ginis = np.apply_along_axis(get_gini, 3, agent_yields)
 
@@ -251,7 +293,6 @@ def build_population_df(outputs):
                         "t": t,
                         "level": float(pop_levels[seed_idx, fee_idx, t]),
                         "yield": float(pop_yields[seed_idx, fee_idx, t]),
-                        "lib_entropy": float(pop_lib_entropies[seed_idx, fee_idx, t]),
                         "r_innov": float(
                             pop_role_rewards[seed_idx, fee_idx, t, role_innovate]
                         ),
@@ -259,7 +300,6 @@ def build_population_df(outputs):
                             pop_role_rewards[seed_idx, fee_idx, t, 1 - role_innovate]
                         ),
                         "prop_innov": float(pop_prop_innovs[seed_idx, fee_idx, t]),
-                        "diversity": float(pop_diversities[seed_idx, fee_idx, t]),
                         "yield_gini": float(pop_yield_ginis[seed_idx, fee_idx, t]),
                         "seed": int(seed),
                     }
@@ -273,10 +313,7 @@ def build_agent_df(outputs):
     t_extra = int(outputs["T_extra"])
     agent_levels = outputs["agent_levels"][:, :, -t_extra:].mean(axis=2)
     agent_yields = outputs["agent_yields"][:, :, -t_extra:].mean(axis=2)
-    agent_lib_entropies = outputs["agent_lib_entropies"][:, :, -t_extra:].mean(axis=2)
     agent_roles = outputs["agent_roles"][:, :, -t_extra:].mean(axis=2)
-    agent_ages = outputs["agent_ages"][:, :, -t_extra:].mean(axis=2)
-    final_agent_ids = outputs["final_agent_ids"]
 
     rows = []
     n_agents = agent_levels.shape[2]
@@ -287,14 +324,9 @@ def build_agent_df(outputs):
                     {
                         "fee": float(fee),
                         "agent_idx": agent_idx,
-                        "agent_id": int(final_agent_ids[seed_idx, fee_idx, agent_idx]),
                         "level": float(agent_levels[seed_idx, fee_idx, agent_idx]),
                         "yield": float(agent_yields[seed_idx, fee_idx, agent_idx]),
-                        "lib_entropy": float(
-                            agent_lib_entropies[seed_idx, fee_idx, agent_idx]
-                        ),
                         "role": float(agent_roles[seed_idx, fee_idx, agent_idx]),
-                        "age": float(agent_ages[seed_idx, fee_idx, agent_idx]),
                         "seed": int(seed),
                     }
                 )
@@ -307,14 +339,12 @@ def build_recipe_dfs(outputs):
     total_timesteps = int(outputs["T"])
     final_libraries = outputs["final_libraries"]
     final_recipe_ids = outputs["final_recipe_ids"]
-    final_agent_ids = outputs["final_agent_ids"]
     final_next_recipe_ids = outputs["final_next_recipe_ids"]
     recipe_lineage_arrays = outputs["recipe_lineage_arrays"]
     num_rules_in_initial_library = int(outputs["num_rules_in_initial_library"])
     empty_recipe_id = int(outputs["empty_recipe_id"])
 
     lineage_rows = []
-    instance_rows = []
     for seed_idx, seed in enumerate(seeds):
         for fee_idx, fee in enumerate(fees):
             recipe_parent_1_ids = recipe_lineage_arrays[seed_idx, fee_idx, :, 0]
@@ -324,12 +354,11 @@ def build_recipe_dfs(outputs):
                 recipe_birth_timesteps = recipe_lineage_arrays[seed_idx, fee_idx, :, 3]
             else:
                 recipe_birth_timesteps = np.full_like(recipe_parent_1_ids, -1)
-            fee_lineage_rows, fee_instance_rows = summarise_recipe_lineages(
+            fee_lineage_rows = summarise_recipe_lineages(
                 seed=int(seed),
                 fee=float(fee),
                 libraries=final_libraries[seed_idx, fee_idx],
                 recipe_ids=final_recipe_ids[seed_idx, fee_idx],
-                agent_ids=final_agent_ids[seed_idx, fee_idx],
                 parent_1_ids=recipe_parent_1_ids,
                 parent_2_ids=recipe_parent_2_ids,
                 creator_agent_ids=recipe_creator_agent_ids,
@@ -340,9 +369,8 @@ def build_recipe_dfs(outputs):
                 final_timestep=total_timesteps - 1,
             )
             lineage_rows.extend(fee_lineage_rows)
-            instance_rows.extend(fee_instance_rows)
 
-    return pd.DataFrame(lineage_rows), pd.DataFrame(instance_rows)
+    return pd.DataFrame(lineage_rows)
 
 
 def build_recipe_descendant_df(outputs):
@@ -382,12 +410,8 @@ def build_recipe_descendant_df(outputs):
                 recipe_id: set()
                 for recipe_id in range(num_rules_in_initial_library, next_recipe_id)
             }
-            descendant_copy_counts = {
-                recipe_id: 0
-                for recipe_id in range(num_rules_in_initial_library, next_recipe_id)
-            }
 
-            for focal_recipe_id, focal_n_copies in extant_copy_count_map.items():
+            for focal_recipe_id in extant_copy_count_map:
                 ancestor_event_ids, _ = get_recipe_lineage_stats(
                     focal_recipe_id,
                     parent_1_ids,
@@ -401,7 +425,6 @@ def build_recipe_descendant_df(outputs):
                     if ancestor_recipe_id == focal_recipe_id:
                         continue
                     unique_descendants[ancestor_recipe_id].add(focal_recipe_id)
-                    descendant_copy_counts[ancestor_recipe_id] += focal_n_copies
 
             for recipe_id in range(num_rules_in_initial_library, next_recipe_id):
                 rows.append(
@@ -411,11 +434,9 @@ def build_recipe_descendant_df(outputs):
                         "recipe_id": recipe_id,
                         "creator_agent_id": int(creator_agent_ids[recipe_id]),
                         "is_extant": int(recipe_id in extant_copy_count_map),
-                        "n_copies": int(extant_copy_count_map.get(recipe_id, 0)),
                         "n_unique_extant_descendants": len(
                             unique_descendants[recipe_id]
                         ),
-                        "n_extant_descendant_copies": descendant_copy_counts[recipe_id],
                         "has_extant_descendants": int(
                             len(unique_descendants[recipe_id]) > 0
                         ),
@@ -446,11 +467,17 @@ def build_recipe_recombination_df(outputs):
             creator_agent_ids = recipe_lineage_arrays[seed_idx, fee_idx, :, 2][
                 :next_recipe_id
             ]
+            if recipe_lineage_arrays.shape[-1] >= 4:
+                birth_timesteps = recipe_lineage_arrays[seed_idx, fee_idx, :, 3][
+                    :next_recipe_id
+                ]
+            else:
+                birth_timesteps = np.full(next_recipe_id, -1, dtype=np.int32)
+            lineage_memo = {}
 
             for recipe_id in range(num_rules_in_initial_library, next_recipe_id):
                 parent_1_id = int(parent_1_ids[recipe_id])
                 parent_2_id = int(parent_2_ids[recipe_id])
-                creator_agent_id = int(creator_agent_ids[recipe_id])
                 is_combine_event = int(
                     parent_1_id != empty_recipe_id and parent_2_id != empty_recipe_id
                 )
@@ -473,17 +500,17 @@ def build_recipe_recombination_df(outputs):
                     and parent_1_creator_id != parent_2_creator_id
                 )
 
-                is_recombination_v2 = int(
-                    is_recombination_v1
-                    and creator_agent_id != empty_recipe_id
-                    and len(
-                        {
-                            parent_1_creator_id,
-                            parent_2_creator_id,
-                            creator_agent_id,
-                        }
-                    )
-                    == 3
+                distance_stats = get_recombination_distance_stats(
+                    parent_1_id,
+                    parent_2_id,
+                    recipe_id,
+                    parent_1_ids,
+                    parent_2_ids,
+                    creator_agent_ids,
+                    birth_timesteps,
+                    num_rules_in_initial_library,
+                    empty_recipe_id,
+                    lineage_memo,
                 )
 
                 rows.append(
@@ -491,14 +518,13 @@ def build_recipe_recombination_df(outputs):
                         "seed": int(seed),
                         "fee": float(fee),
                         "recipe_id": recipe_id,
-                        "creator_agent_id": creator_agent_id,
-                        "parent_1_id": parent_1_id,
-                        "parent_2_id": parent_2_id,
-                        "parent_1_creator_id": parent_1_creator_id,
-                        "parent_2_creator_id": parent_2_creator_id,
-                        "is_combine_event": is_combine_event,
                         "is_recombination_v1": is_recombination_v1,
-                        "is_recombination_v2": is_recombination_v2,
+                        "recomb_branch_distance_innov_only": distance_stats[
+                            "recomb_branch_distance_innov_only"
+                        ],
+                        "recomb_mrca_age_innov_only": distance_stats[
+                            "recomb_mrca_age_innov_only"
+                        ],
                     }
                 )
 
@@ -550,24 +576,22 @@ for key, values in concat_buffers.items():
 
 population_data = build_population_df(outputs)
 agent_data = build_agent_df(outputs)
-recipe_lineage_data, recipe_instance_data = build_recipe_dfs(outputs)
+recipe_lineage_data = build_recipe_dfs(outputs)
 recipe_descendant_data = build_recipe_descendant_df(outputs)
 recipe_recombination_data = build_recipe_recombination_df(outputs)
 
 for df in (
-    recipe_instance_data,
     recipe_lineage_data,
     recipe_descendant_data,
     recipe_recombination_data,
     population_data,
 ):
-    df["log10_fee_value"] = np.round(np.log10(df["fee"]), 3)
-    df["fee_plot"] = 10.0 ** df["log10_fee_value"]
+    df["fee_axis_value"] = get_fee_axis_values(df["fee"])
+    df["fee_plot"] = df["fee_axis_value"]
 
 population_data.to_csv(DATA_DIR / "population_data.csv", index=False)
 agent_data.to_csv(DATA_DIR / "agent_data.csv", index=False)
 recipe_lineage_data.to_csv(DATA_DIR / "recipe_lineage_data.csv", index=False)
-recipe_instance_data.to_csv(DATA_DIR / "recipe_instance_data.csv", index=False)
 recipe_descendant_data.to_csv(DATA_DIR / "recipe_descendant_data.csv", index=False)
 recipe_recombination_data.to_csv(
     DATA_DIR / "recipe_recombination_data.csv", index=False
