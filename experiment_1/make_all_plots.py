@@ -9,7 +9,7 @@ import pandas as pd
 import seaborn as sns
 import statsmodels.api as sm
 
-from utils import save_fig as save_fig_
+from src.utils import save_fig as save_fig_
 
 save_fig = lambda fig, name, subfolder=None: save_fig_(
     fig,

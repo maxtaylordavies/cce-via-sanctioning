@@ -15,3 +15,4 @@ figures/
 data/
 **/notebook.py
 ca*.py
+tmp_plots/

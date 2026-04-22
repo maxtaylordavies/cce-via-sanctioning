@@ -10,7 +10,7 @@ resolution-markers = [
 [[package]]
 name = "cce-via-sanctioning"
 version = "0.1.0"
-source = { virtual = "." }
+source = { editable = "." }
 dependencies = [
     { name = "jax" },
     { name = "numpy" },
