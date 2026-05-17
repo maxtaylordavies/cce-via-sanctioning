@@ -5,21 +5,86 @@ import jax.numpy as jnp
 import numpy as np
 from tqdm import tqdm
 
-from src.grammar import (
-    PAD,
-    MAX_LIBRARY_SIZE,
-    MAX_RECIPE_LEN,
-    MAX_PLANT_LEN,
-    MAX_RULE_LEN,
-    MAX_COMPLEXITY_LEVEL,
-    GOAL_PLANT,
-    NUM_RULES_IN_INITIAL_LIBRARY,
-    EMPTY_RECIPE_ID,
-    initial_recipe_ids,
-    pregenerate_plants,
-    atomic_rules,
-    initial_library,
+MAX_ENERGY = 500
+ROLE_INNOVATE, ROLE_IMITATE = 0, 1
+CHOICE_BETA = 0.1
+NUM_RULES_IN_INITIAL_LIBRARY = 3
+
+# --- 1. Vocabulary ---
+# N = nutrient, H = husk, S = hard shell, T = toxin, P = spike
+PAD, N, H, S, T, P = 0, 1, 2, 3, 4, 5
+VOCAB = [PAD, N, H, S, T, P]
+
+# --- 2. The Environment's "Reverse" Rules ---
+# Each key is a target subsequence, and the value is a list of possible expansions.
+REVERSE_RULES = {
+    (N,): [[H, N, H]],  # wrap nutrient in husks
+    (H,): [[H, H]],  # double the husk
+    (H, H): [[S]],  # fuse adjacent husks into a hard shell
+    (S,): [[S, S]],  # add a husk or double the hard shell
+    (S, S, S): [
+        [S, T, S, T],
+        [P, S, S, P],
+    ],  # add spikes or toxins around/between triple shells
+    (T,): [[T, T]],  # double the toxin
+    (P,): [[P, P]],  # double the spike
+}
+
+# JIT-safe rule tables derived from REVERSE_RULES.
+NUM_REVERSE_RULES = sum(len(expansions) for expansions in REVERSE_RULES.values())
+MAX_TARGET_LEN = max(len(target) for target in REVERSE_RULES)
+MAX_EXPANSION_LEN = max(
+    [
+        len(expansion)
+        for expansions in REVERSE_RULES.values()
+        for expansion in expansions
+    ]
 )
+MAX_RULE_LEN = max(MAX_TARGET_LEN, MAX_EXPANSION_LEN)
+MAX_PLANT_LEN = 25
+MAX_COMPLEXITY_LEVEL = 15
+MAX_RECIPE_LEN = MAX_COMPLEXITY_LEVEL + 10
+MAX_LIBRARY_SIZE = 50
+EMPTY_RECIPE_ID = -1
+
+GOAL_PLANT = jnp.zeros(MAX_PLANT_LEN, dtype=jnp.int32).at[0].set(N)
+
+_reverse_rule_targets = []
+_reverse_rule_target_lengths = []
+_reverse_rule_expansions = []
+_reverse_rule_expansion_lengths = []
+for target, expansions in REVERSE_RULES.items():
+    padded_target = list(target) + [PAD] * (MAX_TARGET_LEN - len(target))
+    for expansion in expansions:
+        _reverse_rule_targets.append(padded_target)
+        _reverse_rule_target_lengths.append(len(target))
+        _reverse_rule_expansions.append(
+            expansion + [PAD] * (MAX_EXPANSION_LEN - len(expansion))
+        )
+        _reverse_rule_expansion_lengths.append(len(expansion))
+
+RULE_TARGETS = jnp.array(_reverse_rule_targets, dtype=jnp.int32)
+RULE_TARGET_LENGTHS = jnp.array(_reverse_rule_target_lengths, dtype=jnp.int32)
+RULE_EXPANSIONS = jnp.array(_reverse_rule_expansions, dtype=jnp.int32)
+RULE_EXPANSION_LENGTHS = jnp.array(_reverse_rule_expansion_lengths, dtype=jnp.int32)
+
+
+# construct initial recipe library from atomic forward rules
+atomic_rules = [jnp.zeros((2, MAX_RULE_LEN), dtype=jnp.int32)]
+initial_library = jnp.zeros((MAX_LIBRARY_SIZE, MAX_RECIPE_LEN), dtype=jnp.int32)
+initial_recipe_ids = jnp.full(MAX_LIBRARY_SIZE, EMPTY_RECIPE_ID, dtype=jnp.int32)
+zeros, counter = jnp.zeros(MAX_RULE_LEN, dtype=jnp.int32), 0
+for target, expansions in REVERSE_RULES.items():
+    rule_result = zeros.at[: len(target)].set(jnp.array(target, dtype=jnp.int32))
+    for expansion in expansions:
+        rule_target = zeros.at[: len(expansion)].set(expansion)
+        rule = jnp.stack([rule_target, rule_result], axis=0)
+        atomic_rules.append(rule)
+        if counter < NUM_RULES_IN_INITIAL_LIBRARY:
+            initial_library = initial_library.at[counter, 0].set(counter + 1)
+            initial_recipe_ids = initial_recipe_ids.at[counter].set(counter)
+        counter += 1
+atomic_rules = jnp.stack(atomic_rules, axis=0)
 
 ATOMIC_TARGETS = atomic_rules[:, 0, :]
 ATOMIC_REPLACEMENTS = atomic_rules[:, 1, :]
@@ -30,9 +95,6 @@ ATOMIC_REPLACEMENT_LENGTHS = jnp.sum(ATOMIC_REPLACEMENTS != PAD, axis=1).astype(
 PLANT_POSITIONS = jnp.arange(MAX_PLANT_LEN, dtype=jnp.int32)
 RULE_OFFSETS = jnp.arange(MAX_RULE_LEN, dtype=jnp.int32)
 
-MAX_ENERGY = 500
-CHOICE_BETA = 0.01
-ROLE_INNOVATE, ROLE_IMITATE = 0, 1
 OP_PROBS = jnp.array(
     [
         0.4,
@@ -55,9 +117,109 @@ def get_acceptance_prob(delta):
     return p_min + (p_max - p_min) * jax.nn.sigmoid(delta / tau)
 
 
+@partial(jax.jit, static_argnames=["complexity_level"])
+def generate_plant(key, complexity_level):
+    plant = jnp.zeros(MAX_PLANT_LEN, dtype=jnp.int32).at[0].set(N)  # Start with just N
+    actual_length = 1  # Track the actual length of the plant sans padding
+    positions = jnp.arange(MAX_PLANT_LEN, dtype=jnp.int32)
+    offsets = jnp.arange(MAX_TARGET_LEN, dtype=jnp.int32)
+
+    def body_fn(carry, _):
+        key, plant, actual_length = carry
+        key, idx_key, rule_key = jax.random.split(key, 3)
+
+        idx_matrix = positions[:, None] + offsets[None, :]
+        safe_idx_matrix = jnp.clip(idx_matrix, 0, MAX_PLANT_LEN - 1)
+        plant_windows = plant[safe_idx_matrix]
+
+        active_target_mask = offsets[None, :] < RULE_TARGET_LENGTHS[:, None]
+        token_matches = plant_windows[:, None, :] == RULE_TARGETS[None, :, :]
+        window_matches = jnp.all(
+            jnp.where(active_target_mask[None, :, :], token_matches, True), axis=2
+        )
+        can_start = positions[:, None] <= (actual_length - RULE_TARGET_LENGTHS[None, :])
+        valid_rule_mask = (
+            window_matches & can_start & (RULE_TARGET_LENGTHS[None, :] > 0)
+        )
+
+        flat_valid_rule_mask = valid_rule_mask.reshape(-1)
+        stop = jnp.sum(flat_valid_rule_mask) == 0
+        flat_rule_probs = flat_valid_rule_mask.astype(jnp.float32)
+        flat_rule_probs = jnp.where(
+            stop, jnp.ones_like(flat_rule_probs), flat_rule_probs
+        )
+        flat_rule_probs /= flat_rule_probs.sum()
+
+        application_idx = jax.random.choice(
+            idx_key, MAX_PLANT_LEN * NUM_REVERSE_RULES, p=flat_rule_probs
+        )
+        target_idx = application_idx // NUM_REVERSE_RULES
+        rule_idx = application_idx % NUM_REVERSE_RULES
+        expansion = RULE_EXPANSIONS[rule_idx]
+        expansion_len = RULE_EXPANSION_LENGTHS[rule_idx]
+        target_len = RULE_TARGET_LENGTHS[rule_idx]
+
+        # Apply the expansion (replace one target subsequence with a variable-length expansion)
+        new_positions = jnp.arange(MAX_PLANT_LEN, dtype=jnp.int32)
+
+        # Prefix positions copy directly from the original plant.
+        src_prefix = new_positions
+
+        # Expansion region sources from expansion[] using target-relative offsets.
+        src_expansion = new_positions - target_idx
+
+        # Tail shifts by the change in subsequence length after replacement.
+        src_tail = new_positions - (expansion_len - target_len)
+
+        in_prefix = new_positions < target_idx
+        in_expansion = (new_positions >= target_idx) & (
+            new_positions < (target_idx + expansion_len)
+        )
+
+        src_idx = jnp.where(in_prefix, src_prefix, src_tail)
+        src_idx = jnp.clip(src_idx, 0, MAX_PLANT_LEN - 1)
+        copied = plant[src_idx]
+
+        expansion_idx = jnp.clip(src_expansion, 0, MAX_EXPANSION_LEN - 1)
+        expansion_vals = expansion[expansion_idx]
+        expansion_vals = jnp.where(in_expansion, expansion_vals, PAD)
+
+        new_plant = jnp.where(in_expansion, expansion_vals, copied)
+
+        new_actual_length = actual_length + expansion_len - target_len
+        stop = stop | (new_actual_length >= MAX_PLANT_LEN)
+
+        # If stopped, keep old plant/length; else apply update.
+        plant_out = jnp.where(stop, plant, new_plant)
+        actual_length_out = jnp.where(stop, actual_length, new_actual_length)
+
+        # Emit the plant state for this step.
+        return (key, plant_out, actual_length_out), plant_out
+
+    carry = (key, plant, actual_length)
+    carry, history = jax.lax.scan(body_fn, carry, jnp.arange(complexity_level))
+
+    # add the initial plant to the start of the history
+    history = jnp.concatenate([plant[None, :], history], axis=0)
+
+    _, final_plant, _ = carry
+    return final_plant, history
+
+
+def pregenerate_plants(key, num_per_level, max_level):
+    plants = jnp.zeros((max_level + 1, num_per_level, MAX_PLANT_LEN), dtype=jnp.int32)
+    for cl in range(max_level + 1):
+        key, subkey = jax.random.split(key)
+        keys = jax.random.split(subkey, num_per_level)
+        tmp, _ = jax.vmap(lambda k: generate_plant(k, cl))(keys)
+        plants = plants.at[cl].set(tmp)
+    return plants
+
+
 @partial(jax.jit, static_argnames=["n"])
 def sample_levels(key, energy, n):
-    avg_level = (energy / MAX_ENERGY) * MAX_COMPLEXITY_LEVEL
+    _energy = jnp.clip(energy, 0, MAX_ENERGY)
+    avg_level = (_energy / MAX_ENERGY) * MAX_COMPLEXITY_LEVEL
     lo = jnp.floor(avg_level)
     p = jnp.array([1 - (avg_level - lo), avg_level - lo])
     levels = jax.random.choice(key, jnp.array([lo, lo + 1]), p=p, shape=(n,))
@@ -133,6 +295,20 @@ def foraging_cost(level):
 
 
 @jax.jit
+def evaluate_recipe(plants, levels, recipe, rule_cost=0.01):
+    processed = jax.vmap(lambda plant: apply_recipe(plant, recipe))(plants)
+
+    successes = jnp.all(processed == GOAL_PLANT, axis=1)
+
+    yields = successes.astype(jnp.float32) * plant_value(levels)
+
+    recipe_len = jnp.sum(recipe != PAD)
+    yields -= rule_cost * recipe_len
+
+    return jnp.maximum(yields, 0.0)
+
+
+@jax.jit
 def evaluate_library(plants, levels, library, rule_cost=0.01):
     """
     Evaluates a library of recipes on a batch of plants.
@@ -145,29 +321,16 @@ def evaluate_library(plants, levels, library, rule_cost=0.01):
     Returns:
         average yield across batch
     """
-    recipe_lengths = jnp.sum(library != PAD, axis=1)
-
-    def eval_single_plant(plant, level):
-        processed = jax.vmap(lambda recipe: apply_recipe(plant, recipe))(library)
-
-        # determine if each processed plant matches the goal plant
-        successes = jnp.all(processed == GOAL_PLANT, axis=1)
-
-        # scale successful yields by original plant complexity
-        yields = successes.astype(jnp.float32) * plant_value(level)
-
-        # calculate the actual length of each recipe (number of non-PAD rules)
-        yields -= rule_cost * recipe_lengths  # penalize longer recipes
-
-        return jnp.maximum(yields, 0.0)  # ensure yields are non-negative
-
-    yields = jax.vmap(eval_single_plant, in_axes=(0, 0))(plants, levels)
-
-    best_recipe = yields.mean(
+    # scores has shape (n_recipes, n_plants)
+    scores = jax.vmap(
+        lambda recipe: evaluate_recipe(plants, levels, recipe, rule_cost)
+    )(library)
+    best_recipe_idx = scores.mean(axis=1).argmax()
+    per_plant_max = scores.max(
         axis=0
-    ).argmax()  # recipe that achieved the highest average yield across the batch
-    best_yields = yields.max(axis=1)  # best yield per plant
-    return best_yields.mean(), (best_yields > 0).mean(), best_recipe
+    )  # best yield achieved for each plant across all recipes
+    avg_yield = per_plant_max.mean()  # average of best yields across the batch
+    return avg_yield, per_plant_max, best_recipe_idx
 
 
 @jax.jit
@@ -329,8 +492,8 @@ def imitate_recipe(
     key_agent, _ = jax.random.split(key)
 
     # select random neighbour to imitate from
-    p = can_imitate[agent_idx]
-    demonstrator_idx = jax.random.choice(key_agent, n_agents, p=p / p.sum())
+    p = can_imitate / can_imitate.sum()
+    demonstrator_idx = jax.random.choice(key_agent, n_agents, p=p)
 
     # select the recipe that contributed most to the demonstrator's yield in the most recent batch
     recipe_idx = best_recipe_idxs[demonstrator_idx]
@@ -351,50 +514,6 @@ def imitate_recipe(
     )
 
 
-@jax.jit
-def compute_population_jaccard(libraries):
-    """
-    Computes the mean pairwise Jaccard distance for an entire population.
-
-    Args:
-        libraries: jnp.ndarray of shape (n_agents, max_library_len, max_recipe_len)
-
-    Returns:
-        mean_dist: Scalar float representing the average diversity.
-        dist_matrix: The full (N, N) distance matrix.
-    """
-    n_agents, library_size, _ = libraries.shape
-
-    # Identify non-empty recipes and deduplicate within each library by keeping
-    # only the first occurrence of each recipe, matching the previous semantics.
-    valid = jnp.any(libraries != PAD, axis=-1)
-    self_matches = jnp.all(
-        libraries[:, :, None, :] == libraries[:, None, :, :], axis=-1
-    )
-    first_occurrence = jnp.arange(library_size)[None, :] == jnp.argmax(
-        self_matches, axis=2
-    )
-    unique_mask = valid & first_occurrence
-    unique_sizes = jnp.sum(unique_mask, axis=1)
-
-    # Pairwise recipe equality across the full population.
-    pair_matches = jnp.all(
-        libraries[:, None, :, None, :] == libraries[None, :, None, :, :], axis=-1
-    )
-    in_other_library = jnp.any(pair_matches & valid[None, :, None, :], axis=3)
-    intersections = jnp.sum(unique_mask[:, None, :] & in_other_library, axis=2)
-
-    unions = unique_sizes[:, None] + unique_sizes[None, :] - intersections
-    dist_matrix = jnp.where(unions == 0, 0.0, 1.0 - (intersections / unions))
-
-    # Compute mean of the upper triangle (ignoring the diagonal).
-    num_pairs = n_agents * (n_agents - 1) / 2
-    upper_tri = jnp.triu(dist_matrix, k=1)
-    mean_dist = jnp.sum(upper_tri) / num_pairs
-
-    return mean_dist, dist_matrix
-
-
 @partial(jax.jit, static_argnames=("T", "grid_length"))
 def run_simulation_loop(
     key,
@@ -403,16 +522,17 @@ def run_simulation_loop(
     T,
     final_phase=500,
     n_forage=10,
-    n_innov_attempts=1,
-    innov_cost=0.2,
-    imit_fee=0.1,
+    n_innov_attempts=3,
+    innov_cost=1.0,
+    imit_fee=0.0,
     imit_dist_threshold=1,
     learning_rate=0.1,
-    diversity_eval_every=10,
     p_death=0.001,
 ):
     n_agents = grid_length**2
     max_recipe_ids = NUM_RULES_IN_INITIAL_LIBRARY + (T * n_agents)
+
+    # Compute pairwise toroidal distances between agents for imitation.
     agent_idxs = jnp.arange(n_agents)
     agent_locs = jnp.stack(
         [
@@ -420,9 +540,13 @@ def run_simulation_loop(
             agent_idxs % grid_length,  # column index
         ]
     ).T
-    agent_dists = jnp.abs(agent_locs[:, None] - agent_locs[None, :]).sum(axis=-1)
-    can_imitate = ((agent_dists > 0) & (agent_dists <= imit_dist_threshold)).astype(
-        jnp.float32
+    row_diffs = jnp.abs(agent_locs[:, None, 0] - agent_locs[None, :, 0])
+    col_diffs = jnp.abs(agent_locs[:, None, 1] - agent_locs[None, :, 1])
+    torus_row_dists = jnp.minimum(row_diffs, grid_length - row_diffs)
+    torus_col_dists = jnp.minimum(col_diffs, grid_length - col_diffs)
+    agent_dists = torus_row_dists + torus_col_dists
+    neighbours_mask = ((agent_dists > 0) & (agent_dists <= imit_dist_threshold)).astype(
+        jnp.bool
     )
 
     plants_per_level = plants.shape[1]
@@ -440,13 +564,15 @@ def run_simulation_loop(
     # (keys, energies) -> foraged_plants, levels
     vmapped_forage = jax.vmap(forage, in_axes=(0, 0))
 
-    # (foraged_plant, level, libraries) -> avg yields, success_rates, best_recipe_idxs
+    # (foraged_plant, level, libraries) -> avg yields, per-plant max yields, best recipe indices
     vmapped_eval_library = jax.vmap(evaluate_library, in_axes=(0, 0, 0))
 
     @jax.jit
     def update_library(
         key,
         agent_idx,
+        curr_yield_per_plant,
+        energies,
         libraries,
         recipe_ids,
         foraged_plants,
@@ -456,13 +582,18 @@ def run_simulation_loop(
         recipe_ages,
     ):
         # ROLE KEY: 0 = innovate, 1 = imitate
-
         innov_key, adopt_key = jax.random.split(key)
 
         # compute avg yield of current library over n-step history
         plant_batch = foraged_plants[agent_idx]
         level_batch = foraged_levels[agent_idx]
-        curr_yield = evaluate_library(plant_batch, level_batch, libraries[agent_idx])[0]
+        curr_yield = curr_yield_per_plant.mean()
+
+        def compute_new_avg_yield(new_library, recipe_idx):
+            new_plant_scores = evaluate_recipe(
+                plant_batch, level_batch, new_library[recipe_idx]
+            )
+            return jnp.maximum(curr_yield_per_plant, new_plant_scores).mean()
 
         def do_innovate(_):
             innov_keys = jax.random.split(innov_key, n_innov_attempts)
@@ -474,9 +605,9 @@ def run_simulation_loop(
                     recipe_ids[agent_idx],
                 )
             )(innov_keys)
-            yields = jax.vmap(
-                lambda lib: evaluate_library(plant_batch, level_batch, lib)[0]
-            )(candidate_libraries)
+
+            yields = jax.vmap(compute_new_avg_yield)(candidate_libraries, new_idxs)
+
             best_innov_idx = yields.argmax()
             return (
                 candidate_libraries[best_innov_idx],
@@ -492,15 +623,13 @@ def run_simulation_loop(
                 key,
                 libraries,
                 recipe_ids,
-                can_imitate,
+                neighbours_mask[agent_idx],
                 agent_idx,
                 n_agents,
                 best_recipe_idxs,
                 recipe_ages,
             )
-            imitation_yield = evaluate_library(
-                plant_batch, level_batch, imitation_library
-            )[0]
+            imitation_yield = compute_new_avg_yield(imitation_library, new_idx)
             return (
                 imitation_library,
                 imitation_yield,
@@ -524,12 +653,21 @@ def run_simulation_loop(
             do_imitate,
             operand=None,
         )
-        size_delta = get_diff_size(libraries[agent_idx], new_library)
+        delta_size = get_diff_size(libraries[agent_idx], new_library)
+        innovation_cost = innov_cost * delta_size
+        chosen_role = roles[agent_idx]
+        action_cost = jnp.where(
+            chosen_role == ROLE_INNOVATE,
+            innovation_cost,
+            imit_fee,
+        )
+        can_afford_action = action_cost <= energies[agent_idx]
 
-        # adopt new library with probability based on yield improvement
+        # An agent who cannot afford the chosen action leaves their library
+        # unchanged and pays no role-specific cost.
         yield_delta = new_yield - curr_yield
         p_accept = get_acceptance_prob(yield_delta)
-        accept = jax.random.bernoulli(adopt_key, p_accept)
+        accept = jax.random.bernoulli(adopt_key, p_accept) & can_afford_action
 
         new_library = jnp.where(accept, new_library, libraries[agent_idx])
         yield_delta = jnp.where(accept, yield_delta, 0.0)
@@ -540,19 +678,36 @@ def run_simulation_loop(
         return (
             new_library,
             yield_delta,
-            size_delta,
+            delta_size,
             new_ages,
             accept,
+            can_afford_action,
             new_idx,
             copied_recipe_id,
             parent_1_id,
             parent_2_id,
         )
 
+    @jax.jit
+    def compute_role_cost_adjustments(
+        affordable_innovators,
+        affordable_imitators,
+    ):
+        n_innov = affordable_innovators.sum()
+        n_imit = affordable_imitators.sum()
+        subsidy = (imit_fee * n_imit) / jnp.maximum(n_innov, 1)
+
+        return jnp.where(
+            affordable_imitators,
+            imit_fee,
+            jnp.where(affordable_innovators, -subsidy, 0.0),
+        )
+
     # (keys, agent_idxs, libraries, recipe_ids, plants, levels, roles, best_recipe_idxs, recipe_ages)
-    # -> updated_libraries, yield_deltas, size_deltas, updated_ages, accepts, update_idxs, copied_recipe_ids, parent_1_ids, parent_2_ids
+    # -> updated_libraries, yield_deltas, delta_sizes, updated_ages, accepts, update_idxs, copied_recipe_ids, parent_1_ids, parent_2_ids
     vmapped_update_library = jax.vmap(
-        update_library, in_axes=(0, 0, None, None, None, None, None, None, None)
+        update_library,
+        in_axes=(0, 0, 0, None, None, None, None, None, None, None, None),
     )
 
     # (libraries) -> library_entropies
@@ -574,7 +729,6 @@ def run_simulation_loop(
             recipe_parent_2_ids,
             recipe_creator_agent_ids,
             recipe_birth_timesteps,
-            prev_diversity,
         ) = carry
 
         # get new keys
@@ -605,11 +759,11 @@ def run_simulation_loop(
         foraged_plants, foraged_levels = vmapped_forage(forage_keys, energies)
 
         # process each agent's foraged batch with their current library
-        avg_yields, success_rates, best_recipe_idxs = vmapped_eval_library(
+        avg_yields, per_plant_yields, best_recipe_idxs = vmapped_eval_library(
             foraged_plants, foraged_levels, libraries
         )
 
-        # each agent chooses a role based on their q-values
+        # Each agent chooses a role via a softmax decision rule over Q-values.
         role_probs = jax.nn.softmax(q_vals / CHOICE_BETA, axis=1)
         roles = jax.random.categorical(policy_key, jnp.log(role_probs), axis=1)
 
@@ -617,9 +771,10 @@ def run_simulation_loop(
         (
             new_libraries,
             yield_deltas,
-            size_deltas,
+            delta_sizes,
             new_recipe_ages,
             accepts,
+            can_afford_actions,
             update_idxs,
             copied_recipe_ids,
             parent_1_ids,
@@ -627,6 +782,8 @@ def run_simulation_loop(
         ) = vmapped_update_library(
             innov_keys,
             jnp.arange(n_agents),
+            per_plant_yields,
+            energies,
             libraries,
             recipe_ids,
             foraged_plants,
@@ -639,6 +796,8 @@ def run_simulation_loop(
         slot_mask = jnp.arange(MAX_LIBRARY_SIZE)[None, :] == update_idxs[:, None]
         accepted_imitations = accepts & (roles == ROLE_IMITATE)
         accepted_innovations = accepts & (roles == ROLE_INNOVATE)
+        affordable_imitations = can_afford_actions & (roles == ROLE_IMITATE)
+        affordable_innovations = can_afford_actions & (roles == ROLE_INNOVATE)
 
         recipe_ids = jnp.where(
             accepted_imitations[:, None] & slot_mask,
@@ -678,17 +837,21 @@ def run_simulation_loop(
         )
         next_recipe_id = next_recipe_id + accepted_innovations_int.sum()
 
-        # compute costs based on foraged plants and role choices
-        forage_costs = foraging_cost(foraged_levels.mean(axis=1))
-        n_innov, n_imit = (roles == ROLE_INNOVATE).sum(), (roles == ROLE_IMITATE).sum()
-        innov_subsidy = imit_fee * n_imit / jnp.maximum(n_innov, 1)
-        innov_costs = (innov_cost * size_deltas) - innov_subsidy
-        role_costs = jnp.where(roles == ROLE_INNOVATE, innov_costs, imit_fee)
-        costs = forage_costs + role_costs
+        # compute costs and rewards
+        role_costs = jnp.where(
+            affordable_innovations,
+            innov_cost * delta_sizes,
+            0.0,
+        )
+        role_costs += compute_role_cost_adjustments(
+            affordable_innovations, affordable_imitations
+        )
+        costs = foraging_cost(foraged_levels.mean(axis=1)) + role_costs
 
         # update each agent's energy
         delta_energies = avg_yields - costs
-        energies = jnp.clip(energies + delta_energies, 0, MAX_ENERGY)
+        # energies = jnp.clip(energies + delta_energies, 0, MAX_ENERGY)
+        energies = jnp.minimum(energies + delta_energies, MAX_ENERGY)
 
         # update q-values based on reward prediction error
         rewards = yield_deltas - role_costs
@@ -696,22 +859,16 @@ def run_simulation_loop(
         new_q_vals = q_vals.at[jnp.arange(n_agents), roles].add(learning_rate * rpe)
 
         # compute average reward for each role
+        total_n_innov, total_n_imit = (roles == ROLE_INNOVATE).sum(), (
+            roles == ROLE_IMITATE
+        ).sum()
         avg_reward_innov = (rewards * (roles == ROLE_INNOVATE)).sum() / jnp.maximum(
-            n_innov, 1
+            total_n_innov, 1
         )
         avg_reward_imit = (rewards * (roles == ROLE_IMITATE)).sum() / jnp.maximum(
-            n_imit, 1
+            total_n_imit, 1
         )
         avg_rewards = jnp.array([avg_reward_innov, avg_reward_imit])
-
-        # compute population diversity (in terms of libraries)
-        should_eval_div = (t % diversity_eval_every) == 0
-        pop_diversity = jax.lax.cond(
-            should_eval_div,
-            lambda libs: compute_population_jaccard(libs)[0],
-            lambda _: prev_diversity,
-            libraries,
-        )
 
         return (
             key,
@@ -728,16 +885,7 @@ def run_simulation_loop(
             recipe_parent_2_ids,
             recipe_creator_agent_ids,
             recipe_birth_timesteps,
-            pop_diversity,
-        ), (
-            foraged_levels.mean(axis=-1),
-            avg_yields,
-            vmapped_get_library_entropy(libraries),
-            avg_rewards,
-            pop_diversity,
-            roles,
-            agent_ages,
-        )
+        ), (foraged_levels.mean(axis=-1), avg_yields, avg_rewards, roles, accepts)
 
     libraries = jnp.tile(initial_library[None, ...], (n_agents, 1, 1))
     energies = jnp.zeros(n_agents, dtype=jnp.float32)
@@ -754,7 +902,7 @@ def run_simulation_loop(
         max_recipe_ids, EMPTY_RECIPE_ID, dtype=jnp.int32
     )
     recipe_birth_timesteps = jnp.full(max_recipe_ids, -1, dtype=jnp.int32)
-    init_diversity, _ = compute_population_jaccard(libraries)
+
     carry = (
         key,
         libraries,
@@ -770,7 +918,6 @@ def run_simulation_loop(
         recipe_parent_2_ids,
         recipe_creator_agent_ids,
         recipe_birth_timesteps,
-        init_diversity,
     )
 
     carry, metrics = jax.lax.scan(body_fn, carry, jnp.arange(T))
@@ -783,11 +930,9 @@ def run_simulation_loop(
     final_recipe_parent_2_ids = carry[11]
     final_recipe_creator_agent_ids = carry[12]
     final_recipe_birth_timesteps = carry[13]
-    jaccard_matrix = compute_population_jaccard(libraries)[1]
 
     return (
         *metrics,
-        jaccard_matrix,
         libraries,
         final_recipe_ids,
         final_agent_ids,
@@ -799,12 +944,12 @@ def run_simulation_loop(
     )
 
 
-seeds = list(range(5))
-grid_length, T_main, T_extra = 10, int(5e3), 500
+seeds = [0, 1, 2]
+grid_length, T_main, T_extra = 10, int(1e4), 500
 T = (
     T_main + T_extra
 )  # total timesteps to run (including extra for averaging agent metrics at the end)
-fees = 10.0 ** jnp.linspace(-3, 1, 9)
+fees = jnp.linspace(-1.0, 1.0, 21)
 
 
 def run_with_fee(key, plants, fee):
@@ -817,12 +962,9 @@ def run_with_fee(key, plants, fee):
 
 all_agent_levels = []
 all_agent_yields = []
-all_agent_lib_entropies = []
 all_pop_role_rewards = []
-all_pop_diversities = []
 all_agent_roles = []
-all_agent_ages = []
-all_jaccard_matrices = []
+all_agent_accepts = []
 all_final_libraries = []
 all_final_recipe_ids = []
 all_final_agent_ids = []
@@ -837,12 +979,9 @@ for seed in tqdm(seeds):
     (
         agent_levels,
         agent_yields,
-        agent_lib_entropies,
         pop_role_rewards,
-        pop_diversities,
         agent_roles,
-        agent_ages,
-        jaccard_matrices,
+        agent_accepts,
         final_libraries,
         final_recipe_ids,
         final_agent_ids,
@@ -855,12 +994,9 @@ for seed in tqdm(seeds):
 
     all_agent_levels.append(np.asarray(agent_levels))
     all_agent_yields.append(np.asarray(agent_yields))
-    all_agent_lib_entropies.append(np.asarray(agent_lib_entropies))
     all_pop_role_rewards.append(np.asarray(pop_role_rewards))
-    all_pop_diversities.append(np.asarray(pop_diversities))
     all_agent_roles.append(np.asarray(agent_roles))
-    all_agent_ages.append(np.asarray(agent_ages))
-    all_jaccard_matrices.append(jaccard_matrices)
+    all_agent_accepts.append(np.asarray(agent_accepts))
     all_final_libraries.append(np.asarray(final_libraries))
     all_final_recipe_ids.append(np.asarray(final_recipe_ids))
     all_final_agent_ids.append(np.asarray(final_agent_ids))
@@ -890,12 +1026,9 @@ simulation_outputs = {
     "role_imitate": np.int32(ROLE_IMITATE),
     "agent_levels": np.stack(all_agent_levels, axis=0),
     "agent_yields": np.stack(all_agent_yields, axis=0),
-    "agent_lib_entropies": np.stack(all_agent_lib_entropies, axis=0),
     "pop_role_rewards": np.stack(all_pop_role_rewards, axis=0),
-    "pop_diversities": np.stack(all_pop_diversities, axis=0),
     "agent_roles": np.stack(all_agent_roles, axis=0),
-    "agent_ages": np.stack(all_agent_ages, axis=0),
-    "jaccard_matrices": np.stack(all_jaccard_matrices, axis=0),
+    "agent_accepts": np.stack(all_agent_accepts, axis=0),
     "final_libraries": np.stack(all_final_libraries, axis=0),
     "final_recipe_ids": np.stack(all_final_recipe_ids, axis=0),
     "final_agent_ids": np.stack(all_final_agent_ids, axis=0),

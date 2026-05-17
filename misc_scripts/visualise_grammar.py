@@ -2,7 +2,7 @@ import jax
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
 
-from src.grammar import (
+from experiment_1.notebook import (
     PAD,
     N,
     H,

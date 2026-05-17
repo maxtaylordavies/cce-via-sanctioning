@@ -4,7 +4,7 @@ import os
 import numpy as np
 import pandas as pd
 
-DATA_DIR = Path("data/experiment_1/5k")
+DATA_DIR = Path("data/experiment_1")
 
 
 def get_gini(values):
@@ -184,7 +184,9 @@ def get_recombination_distance_stats(
     )
 
     recomb_mrca_age_innov_only = (
-        np.nan if np.isnan(mrca_birth_innov_only) else child_birth - mrca_birth_innov_only
+        np.nan
+        if np.isnan(mrca_birth_innov_only)
+        else child_birth - mrca_birth_innov_only
     )
 
     return {
@@ -275,10 +277,12 @@ def build_population_df(outputs):
     pop_role_rewards = outputs["pop_role_rewards"]
     agent_roles = outputs["agent_roles"]
     role_innovate = int(outputs["role_innovate"])
+    role_imitate = int(outputs["role_imitate"])
 
     pop_levels = agent_levels.mean(axis=3)
     pop_yields = agent_yields.mean(axis=3)
     pop_prop_innovs = (agent_roles == role_innovate).mean(axis=3)
+    pop_prop_imits = (agent_roles == role_imitate).mean(axis=3)
     pop_yield_ginis = np.apply_along_axis(get_gini, 3, agent_yields)
 
     rows = []
@@ -300,6 +304,7 @@ def build_population_df(outputs):
                             pop_role_rewards[seed_idx, fee_idx, t, 1 - role_innovate]
                         ),
                         "prop_innov": float(pop_prop_innovs[seed_idx, fee_idx, t]),
+                        "prop_imit": float(pop_prop_imits[seed_idx, fee_idx, t]),
                         "yield_gini": float(pop_yield_ginis[seed_idx, fee_idx, t]),
                         "seed": int(seed),
                     }
@@ -330,6 +335,42 @@ def build_agent_df(outputs):
                         "seed": int(seed),
                     }
                 )
+    return pd.DataFrame(rows)
+
+
+def build_population_run_summary_df(outputs):
+    fees = outputs["fees"]
+    seeds = outputs["seeds"]
+    agent_roles = outputs["agent_roles"]
+    agent_accepts = outputs["agent_accepts"] if "agent_accepts" in outputs else None
+    final_next_recipe_ids = outputs["final_next_recipe_ids"]
+    num_rules_in_initial_library = int(outputs["num_rules_in_initial_library"])
+    role_imitate = int(outputs["role_imitate"])
+
+    rows = []
+    for seed_idx, seed in enumerate(seeds):
+        for fee_idx, fee in enumerate(fees):
+            imitation_attempts = agent_roles[seed_idx, fee_idx] == role_imitate
+            if agent_accepts is None:
+                successful_imitation_events = int(imitation_attempts.sum())
+            else:
+                successful_imitation_events = int(
+                    (
+                        imitation_attempts
+                        & agent_accepts[seed_idx, fee_idx].astype(bool)
+                    ).sum()
+                )
+            rows.append(
+                {
+                    "seed": int(seed),
+                    "fee": float(fee),
+                    "n_innovation_events": int(
+                        final_next_recipe_ids[seed_idx, fee_idx]
+                        - num_rules_in_initial_library
+                    ),
+                    "n_imitation_events": successful_imitation_events,
+                }
+            )
     return pd.DataFrame(rows)
 
 
@@ -478,6 +519,7 @@ def build_recipe_recombination_df(outputs):
             for recipe_id in range(num_rules_in_initial_library, next_recipe_id):
                 parent_1_id = int(parent_1_ids[recipe_id])
                 parent_2_id = int(parent_2_ids[recipe_id])
+                creator_id = int(creator_agent_ids[recipe_id])
                 is_combine_event = int(
                     parent_1_id != empty_recipe_id and parent_2_id != empty_recipe_id
                 )
@@ -499,6 +541,12 @@ def build_recipe_recombination_df(outputs):
                     and has_valid_parent_creators
                     and parent_1_creator_id != parent_2_creator_id
                 )
+                is_recombination_v2 = int(
+                    is_recombination_v1
+                    and creator_id != empty_recipe_id
+                    and creator_id != parent_1_creator_id
+                    and creator_id != parent_2_creator_id
+                )
 
                 distance_stats = get_recombination_distance_stats(
                     parent_1_id,
@@ -519,6 +567,7 @@ def build_recipe_recombination_df(outputs):
                         "fee": float(fee),
                         "recipe_id": recipe_id,
                         "is_recombination_v1": is_recombination_v1,
+                        "is_recombination_v2": is_recombination_v2,
                         "recomb_branch_distance_innov_only": distance_stats[
                             "recomb_branch_distance_innov_only"
                         ],
@@ -576,11 +625,13 @@ for key, values in concat_buffers.items():
 
 population_data = build_population_df(outputs)
 agent_data = build_agent_df(outputs)
+population_run_summary = build_population_run_summary_df(outputs)
 recipe_lineage_data = build_recipe_dfs(outputs)
 recipe_descendant_data = build_recipe_descendant_df(outputs)
 recipe_recombination_data = build_recipe_recombination_df(outputs)
 
 for df in (
+    population_run_summary,
     recipe_lineage_data,
     recipe_descendant_data,
     recipe_recombination_data,
@@ -591,9 +642,10 @@ for df in (
 
 population_data.to_csv(DATA_DIR / "population_data.csv", index=False)
 agent_data.to_csv(DATA_DIR / "agent_data.csv", index=False)
+population_run_summary.to_csv(DATA_DIR / "population_run_summary.csv", index=False)
 recipe_lineage_data.to_csv(DATA_DIR / "recipe_lineage_data.csv", index=False)
 recipe_descendant_data.to_csv(DATA_DIR / "recipe_descendant_data.csv", index=False)
 recipe_recombination_data.to_csv(
     DATA_DIR / "recipe_recombination_data.csv", index=False
 )
-np.save(DATA_DIR / "jaccard_matrices.npy", outputs["jaccard_matrices"])
+# np.save(DATA_DIR / "jaccard_matrices.npy", outputs["jaccard_matrices"])
