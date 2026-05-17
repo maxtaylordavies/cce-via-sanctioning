@@ -9,7 +9,7 @@ import pandas as pd
 import seaborn as sns
 import statsmodels.api as sm
 
-from utils import save_fig as save_fig_
+from src.utils import save_fig as save_fig_
 
 save_fig = lambda fig, name, subfolder=None: save_fig_(
     fig,
@@ -25,6 +25,8 @@ FORAGING_LEVEL_CMAP = LinearSegmentedColormap.from_list(
     "foraging_level", ["#d8f0c8", "#1d5c2f"]
 )
 LINE_COLOR = "#06B48B"
+LINEAR_FIT_COLOR = "#2E8B57"
+QUADRATIC_FIT_COLOR = "#C94C4C"
 
 
 def load_raw_outputs():
@@ -72,11 +74,12 @@ def load_raw_outputs():
 def load_data():
     return {
         "population": pd.read_csv(DATA_DIR / "population_data.csv"),
+        "population_run_summary": pd.read_csv(DATA_DIR / "population_run_summary.csv"),
         "agent": pd.read_csv(DATA_DIR / "agent_data.csv"),
         "recipe_lineage": pd.read_csv(DATA_DIR / "recipe_lineage_data.csv"),
         "recipe_descendant": pd.read_csv(DATA_DIR / "recipe_descendant_data.csv"),
         "recipe_recombination": pd.read_csv(DATA_DIR / "recipe_recombination_data.csv"),
-        "similarity_matrices": 1 - np.load(DATA_DIR / "jaccard_matrices.npy"),
+        # "similarity_matrices": 1 - np.load(DATA_DIR / "jaccard_matrices.npy"),
         "raw_outputs": load_raw_outputs(),
     }
 
@@ -125,69 +128,6 @@ def format_time_series_fee_legend(ax):
 
 def format_fee_title(fee):
     return f"Fee = {fee:g}"
-
-
-def box_and_strip_plot(
-    df,
-    y,
-    ax,
-    title,
-    fee_label_order,
-    fee_palette,
-    y_jitter=None,
-    strip_kws=None,
-):
-    plot_df = df.copy()
-    y_ = y
-    if y_jitter is not None:
-        y_ = y + "_jittered"
-        plot_df[y_] = plot_df[y] + np.random.normal(0, y_jitter, size=len(plot_df))
-
-    default_strip_kws = {"alpha": 0.05, "size": 3, "dodge": False, "jitter": True}
-    if strip_kws is None:
-        strip_kws = {}
-    strip_kws = {**default_strip_kws, **strip_kws}
-
-    sns.stripplot(
-        data=plot_df,
-        x="fee_label",
-        y=y_,
-        order=fee_label_order,
-        hue="fee_label",
-        hue_order=fee_label_order,
-        palette=fee_palette,
-        ax=ax,
-        **strip_kws,
-    )
-    sns.boxplot(
-        data=plot_df,
-        x="fee_label",
-        y=y,
-        hue="fee_label",
-        order=fee_label_order,
-        hue_order=fee_label_order,
-        palette=fee_palette,
-        showfliers=False,
-        dodge=False,
-        width=0.7,
-        boxprops={"edgecolor": "black", "zorder": 3},
-        whiskerprops={"color": "black", "zorder": 3},
-        capprops={"color": "black", "zorder": 3},
-        medianprops={"color": "black", "zorder": 3},
-        ax=ax,
-    )
-
-    for patch, fee_label in zip(ax.patches[: len(fee_label_order)], fee_label_order):
-        r, g, b = fee_palette[fee_label]
-        patch.set_facecolor((r, g, b, 0.3))
-        patch.set_edgecolor("black")
-
-    if ax.legend_ is not None:
-        ax.legend_.remove()
-
-    ax.set_title(title)
-    ax.set_xlabel("fee")
-    sns.despine(ax=ax, left=True, bottom=True)
 
 
 def format_p_value(p_value):
@@ -398,7 +338,9 @@ def standardized_ols_coef(df, outcome, predictor, controls=()):
     return float(model.params[predictor])
 
 
-def plot_yield_relationship(ax, df, x, fee_label_order, legend=False):
+def plot_yield_relationship(
+    ax, df, x, fee_label_order, legend=False, show_both_fits=False
+):
     sns.scatterplot(
         data=df,
         x=x,
@@ -416,20 +358,44 @@ def plot_yield_relationship(ax, df, x, fee_label_order, legend=False):
     use_quad, lin_p, quad_p = use_quadratic_model(linear_model, quadratic_model, x)
     if linear_model is not None:
         x_grid = np.linspace(fit_df[x].min(), fit_df[x].max(), 200)
-        if use_quad:
-            pred_df = pd.DataFrame(
+        linear_pred_df = pd.DataFrame({"const": 1.0, x: x_grid})
+        linear_y_pred = linear_model.predict(linear_pred_df)
+
+        quadratic_y_pred = None
+        if quadratic_model is not None:
+            quadratic_pred_df = pd.DataFrame(
                 {
                     "const": 1.0,
                     "x_centered": x_grid - mean_x,
                 }
             )
-            pred_df["x_centered_sq"] = pred_df["x_centered"] ** 2
-            y_pred = quadratic_model.predict(pred_df)
+            quadratic_pred_df["x_centered_sq"] = quadratic_pred_df["x_centered"] ** 2
+            quadratic_y_pred = quadratic_model.predict(quadratic_pred_df)
+
+        if show_both_fits and quadratic_y_pred is not None:
+            ax.plot(
+                x_grid,
+                linear_y_pred,
+                color=LINEAR_FIT_COLOR,
+                alpha=1.0,
+                linewidth=2.5,
+            )
+            ax.plot(
+                x_grid,
+                quadratic_y_pred,
+                color=QUADRATIC_FIT_COLOR,
+                alpha=1.0,
+                linewidth=2.5,
+            )
         else:
-            pred_df = pd.DataFrame({"const": 1.0, x: x_grid})
-            y_pred = linear_model.predict(pred_df)
-        ax.plot(x_grid, y_pred, color=LINE_COLOR, alpha=1.0, linewidth=3)
+            y_pred = (
+                quadratic_y_pred
+                if use_quad and quadratic_y_pred is not None
+                else linear_y_pred
+            )
+            ax.plot(x_grid, y_pred, color=LINE_COLOR, alpha=1.0, linewidth=3)
     annotate_regression(ax, df, x, "yield")
+    ax.set_ylim(bottom=0)
     sns.despine(ax=ax, left=True, bottom=True)
 
     model = "quadratic" if use_quad else "linear"
@@ -439,12 +405,18 @@ def plot_yield_relationship(ax, df, x, fee_label_order, legend=False):
 
 def build_recipe_plot_data(
     population_data,
+    population_run_summary,
     recipe_lineage_data,
     recipe_recombination_data,
     fee_label_map,
     fee_label_order,
 ):
-    for df in (recipe_lineage_data, recipe_recombination_data, population_data):
+    for df in (
+        recipe_lineage_data,
+        recipe_recombination_data,
+        population_data,
+        population_run_summary,
+    ):
         add_fee_plot_column(df, fee_label_map, fee_label_order)
 
     recipe_key_cols = ["seed", "fee_axis_value", "recipe_id"]
@@ -484,25 +456,31 @@ def build_recipe_plot_data(
         on=["seed", "fee_axis_value", "fee_plot", "fee_label"],
     )
 
-    recombination_summary = (
+    recombination_event_summary = (
         recipe_recombination_data.groupby(["seed", "fee_axis_value"], as_index=False)
         .apply(
             lambda x: pd.Series(
                 {
-                    "n_innovation_events": len(x),
                     "n_recombination_v1": x["is_recombination_v1"].sum(),
+                    "n_recombination_v2": x["is_recombination_v2"].sum(),
                     "mean_recomb_branch_distance_innov_only": x.loc[
                         x["is_recombination_v1"] == 1,
                         "recomb_branch_distance_innov_only",
                     ].mean(),
-                    "mean_recomb_mrca_age_innov_only": x.loc[
-                        x["is_recombination_v1"] == 1,
-                        "recomb_mrca_age_innov_only",
+                    "mean_recomb_branch_distance_innov_only_v2": x.loc[
+                        x["is_recombination_v2"] == 1,
+                        "recomb_branch_distance_innov_only",
                     ].mean(),
                 }
             )
         )
         .reset_index(drop=True)
+    )
+    add_fee_plot_column(recombination_event_summary, fee_label_map, fee_label_order)
+    recombination_summary = population_run_summary.merge(
+        recombination_event_summary,
+        on=["seed", "fee_axis_value", "fee_plot", "fee_label"],
+        how="left",
     )
     add_fee_plot_column(recombination_summary, fee_label_map, fee_label_order)
     recombination_outcome_summary = recombination_summary.merge(
@@ -896,39 +874,37 @@ def plot_performance_metrics(pop_df):
         )
 
     plot_df = plot_df[
-        (plot_df["t"] < plot_df["t"].max() - 500)
-        & (plot_df["t"] % 20 == 0)
-        # & (plot_df["fee"] < plot_df["fee"].max())
+        (plot_df["t"] < plot_df["t"].max() - 500) & (plot_df["t"] % 20 == 0)
     ]
 
-    fig, axs = plt.subplots(2, 3, figsize=(10, 6), sharex=True)
-    axs = axs.flatten()
-    palette = sns.color_palette("plasma", n_colors=plot_df["fee"].nunique())
-    titles = {
-        "level": "Average level of foraged plants",
-        "yield": "Average yield",
-        "yield_gini": "Yield inequality (Gini)",
-        "r_innov": "Average reward for innovating",
-        "r_imit": "Average reward for imitating",
-        "prop_innov": "Average proportion of innovators",
-    }
+    # fig, axs = plt.subplots(2, 3, figsize=(10, 6), sharex=True)
+    # axs = axs.flatten()
+    # palette = sns.color_palette("plasma", n_colors=plot_df["fee"].nunique())
+    # titles = {
+    #     "level": "Average level of foraged plants",
+    #     "yield": "Average yield",
+    #     "yield_gini": "Yield inequality (Gini)",
+    #     "r_innov": "Average reward for innovating",
+    #     "r_imit": "Average reward for imitating",
+    #     "prop_innov": "Average proportion of innovators",
+    # }
 
-    for i, metric in enumerate(titles):
-        sns.lineplot(
-            plot_df,
-            x="t",
-            y=metric,
-            hue="fee",
-            palette=palette,
-            legend=i == 0,
-            ax=axs[i],
-        )
-        axs[i].set_title(titles[metric])
-        sns.despine(ax=axs[i], left=True, bottom=True)
-        if i == 0:
-            format_time_series_fee_legend(axs[i])
+    # for i, metric in enumerate(titles):
+    #     sns.lineplot(
+    #         plot_df,
+    #         x="t",
+    #         y=metric,
+    #         hue="fee",
+    #         palette=palette,
+    #         legend=i == 0,
+    #         ax=axs[i],
+    #     )
+    #     axs[i].set_title(titles[metric])
+    #     sns.despine(ax=axs[i], left=True, bottom=True)
+    #     if i == 0:
+    #         format_time_series_fee_legend(axs[i])
 
-    save_fig(fig, "performance_metrics_over_time")
+    # save_fig(fig, "performance_metrics_over_time")
     return plot_df
 
 
@@ -972,35 +948,50 @@ def plot_preliminary_innovation_decay(raw_outputs):
     save_fig(fig, "preliminary_innovation_decay_fee_0")
 
 
-def plot_final_performance_metrics(pop_df):
+def plot_final_performance_metrics(pop_df, population_run_summary):
     final_pop_df = (
         pop_df.groupby(["fee", "seed"])
         .apply(lambda x: x.loc[x["t"] >= x["t"].max() - 500].mean(numeric_only=True))
         .reset_index()
         .drop(columns=["t"])
     )
+    final_pop_df = final_pop_df.merge(
+        population_run_summary[
+            ["fee", "seed", "n_innovation_events", "n_imitation_events"]
+        ],
+        on=["fee", "seed"],
+        how="left",
+    )
 
-    fig, axs = plt.subplots(1, 2, figsize=(8, 4), sharex=True)
+    fig, axs = plt.subplots(1, 3, figsize=(14.5, 4))
     axs = axs.flatten()
     titles = {
-        # "level": "Average level of foraged plants",
-        "yield": "Average yield",
-        # "yield_gini": "Yield inequality (Gini)",
-        "prop_innov": "Proportion of innovators",
+        # "prop_innov": "Role distribution (over final 500 timesteps)",
+        "yield": "Average yield (over final 500 timesteps)",
+        "n_innovation_events": "Total successful innovation events",
+        "n_imitation_events": "Total successful transmission events",
     }
     labels = {
+        # "prop_innov": "Proportion",
         "yield": "Yield",
-        "prop_innov": "Proportion",
+        "n_innovation_events": "Count",
+        "n_imitation_events": "Count",
     }
     metric_groups = [
-        # ("level",),
         ("yield",),
-        # ("yield_gini",),
-        # ("r_innov", "r_imit"),
-        ("prop_innov",),
+        # ("prop_innov", "prop_imit"),
+        ("n_innovation_events",),
+        ("n_imitation_events",),
     ]
+    lower_goldilocks = 0.1
+    left_bound, right_bound = -1.05, 1.05
 
     for i, metric_group in enumerate(metric_groups):
+        axs[i].axvspan(
+            left_bound, lower_goldilocks, color="#f4c7c3", alpha=0.3, zorder=0
+        )
+        axs[i].axvspan(lower_goldilocks, 0.5, color="#d8f0c8", alpha=0.3, zorder=0)
+        axs[i].axvspan(0.5, right_bound, color="#f4c7c3", alpha=0.3, zorder=0)
         if len(metric_group) == 2:
             for metric, color in zip(metric_group, ["red", "blue"]):
                 sns.lineplot(
@@ -1013,11 +1004,6 @@ def plot_final_performance_metrics(pop_df):
                     label=metric,
                     ax=axs[i],
                 )
-            axs[i].set(
-                title="Final average reward by role",
-                xlabel="$c$",
-                ylabel="Average reward",
-            )
             axs[i].legend()
         else:
             metric = metric_group[0]
@@ -1030,17 +1016,159 @@ def plot_final_performance_metrics(pop_df):
                 err_style="bars",
                 ax=axs[i],
             )
-            axs[i].set(
-                title=f"Final {titles[metric].lower()} vs $c$",
-                xlabel="$c$",
-                ylabel=labels[metric],
-            )
+        axs[i].set(
+            title=titles[metric_group[0]],
+            xlabel="$c$",
+            ylabel=labels[metric_group[0]],
+            xlim=(left_bound, right_bound),
+        )
+        if i == 0:
+            axs[i].set_ylim(top=8.0)
         sns.despine(ax=axs[i], left=True, bottom=True)
+
+    trans = axs[0].get_xaxis_transform()
+    axs[0].text(
+        left_bound + 0.07,
+        0.98,
+        "too little\ninnovation",
+        transform=trans,
+        ha="left",
+        va="top",
+        fontsize=9,
+        fontweight="bold",
+        color="#831e17",
+    )
+    axs[0].text(
+        lower_goldilocks + 0.2,
+        0.98,
+        '"goldilocks\nzone"',
+        transform=trans,
+        ha="center",
+        va="top",
+        fontsize=9,
+        fontweight="bold",
+        color="#0e4812",
+    )
+    axs[0].text(
+        right_bound - 0.07,
+        0.98,
+        "too little\ntransmission",
+        transform=trans,
+        ha="right",
+        va="top",
+        fontsize=9,
+        fontweight="bold",
+        color="#831e17",
+    )
 
     for ax in axs[len(metric_groups) :]:
         ax.set_visible(False)
 
     save_fig(fig, "final_performance_metrics")
+
+
+def plot_final_performance_metrics_normalized_events(pop_df, population_run_summary):
+    final_pop_df = (
+        pop_df.groupby(["fee", "seed"])
+        .apply(lambda x: x.loc[x["t"] >= x["t"].max() - 500].mean(numeric_only=True))
+        .reset_index()
+        .drop(columns=["t"])
+    )
+    final_pop_df = final_pop_df.merge(
+        population_run_summary[
+            ["fee", "seed", "n_innovation_events", "n_imitation_events"]
+        ],
+        on=["fee", "seed"],
+        how="left",
+    )
+
+    def min_max_normalize(values):
+        values = values.astype(float)
+        min_val = values.min()
+        max_val = values.max()
+        if np.isclose(max_val, min_val):
+            return np.zeros_like(values, dtype=float)
+        return (values - min_val) / (max_val - min_val)
+
+    final_pop_df["n_innovation_events_norm"] = min_max_normalize(
+        final_pop_df["n_innovation_events"].to_numpy()
+    )
+    final_pop_df["n_imitation_events_norm"] = min_max_normalize(
+        final_pop_df["n_imitation_events"].to_numpy()
+    )
+    final_pop_df["event_sum_norm"] = (
+        final_pop_df["n_innovation_events_norm"]
+        + final_pop_df["n_imitation_events_norm"]
+    )
+
+    lower_goldilocks = 0.1
+    left_bound, right_bound = -1.05, 1.05
+
+    fig, ax = plt.subplots(1, 1, figsize=(6.8, 4.2))
+    ax.axvspan(left_bound, lower_goldilocks, color="#f4c7c3", alpha=0.3, zorder=0)
+    ax.axvspan(lower_goldilocks, 0.5, color="#d8f0c8", alpha=0.3, zorder=0)
+    ax.axvspan(0.5, right_bound, color="#f4c7c3", alpha=0.3, zorder=0)
+
+    for metric, color, label in [
+        ("n_innovation_events_norm", "#C94C4C", "Innovation events"),
+        ("n_imitation_events_norm", "#3B82C4", "Transmission events"),
+        ("event_sum_norm", "#111111", "Sum"),
+    ]:
+        sns.lineplot(
+            final_pop_df,
+            x="fee",
+            y=metric,
+            marker="o",
+            color=color,
+            err_style="bars",
+            label=label,
+            ax=ax,
+        )
+
+    trans = ax.get_xaxis_transform()
+    ax.text(
+        left_bound + 0.07,
+        0.98,
+        "too little\ninnovation",
+        transform=trans,
+        ha="left",
+        va="top",
+        fontsize=9,
+        fontweight="bold",
+        color="#831e17",
+    )
+    ax.text(
+        lower_goldilocks + 0.2,
+        0.98,
+        '"goldilocks\nzone"',
+        transform=trans,
+        ha="center",
+        va="top",
+        fontsize=9,
+        fontweight="bold",
+        color="#0e4812",
+    )
+    ax.text(
+        right_bound - 0.07,
+        0.98,
+        "too little\ntransmission",
+        transform=trans,
+        ha="right",
+        va="top",
+        fontsize=9,
+        fontweight="bold",
+        color="#831e17",
+    )
+    ax.set(
+        title="Normalized successful event counts",
+        xlabel="$c$",
+        ylabel="Normalized value",
+        xlim=(left_bound, right_bound),
+        ylim=(0, 2.05),
+    )
+    ax.legend(title="")
+    sns.despine(ax=ax, left=True, bottom=True)
+    save_fig(fig, "final_performance_metrics_normalized_events")
 
 
 def plot_agent_heatmaps(agent_df):
@@ -1143,8 +1271,6 @@ def plot_similarity(similarity_matrices, fees):
 
 def plot_population_level_metrics(
     fee_outcome_summary,
-    spatial_summary,
-    spatial_outcome_summary,
     recombination_summary,
     recombination_outcome_summary,
     specialisation_summary,
@@ -1155,15 +1281,9 @@ def plot_population_level_metrics(
     posthumous_outcome_summary,
     fee_label_order,
     fee_palette,
+    show_both_fits=True,
 ):
     metric_specs = [
-        (
-            "specialisation",
-            "Population specialisation",
-            "Normalised MI",
-            specialisation_summary,
-            specialisation_outcome_summary,
-        ),
         (
             "n_innovation_events",
             "Total number of innovation events over population history",
@@ -1172,22 +1292,36 @@ def plot_population_level_metrics(
             recombination_outcome_summary,
         ),
         (
-            "n_recombination_v1",
+            "specialisation",
+            "Role specialisation",
+            "Normalised MI",
+            specialisation_summary,
+            specialisation_outcome_summary,
+        ),
+        (
+            "n_recombination_v2",
             "Total number of recombination events over population history",
             "Count",
             recombination_summary,
             recombination_outcome_summary,
         ),
-        (
-            "mean_recomb_branch_distance_innov_only",
-            "Mean recombination branch distance",
-            "Timesteps",
-            recombination_summary,
-            recombination_outcome_summary,
-        ),
+        # (
+        #     "mean_recomb_branch_distance_innov_only",
+        #     "Mean v1 recombination branch distance",
+        #     "Timesteps",
+        #     recombination_summary,
+        #     recombination_outcome_summary,
+        # ),
+        # (
+        #     "mean_recomb_branch_distance_innov_only_v2",
+        #     "Mean v2 recombination branch distance",
+        #     "Timesteps",
+        #     recombination_summary,
+        #     recombination_outcome_summary,
+        # ),
         (
             "mean_n_unique_innovators",
-            "Mean number of unique innovators in final recipe histories",
+            "Mean number of unique contributors to final recipes",
             "Count",
             fee_outcome_summary,
             fee_outcome_summary,
@@ -1199,40 +1333,33 @@ def plot_population_level_metrics(
             fee_outcome_summary,
             fee_outcome_summary,
         ),
-        (
-            "mean_recipe_ancestor_age",
-            "Mean age of final recipes' oldest ancestors",
-            "Timesteps",
-            fee_outcome_summary,
-            fee_outcome_summary,
-        ),
-        (
-            "beta_extant_on_depth_age_controlled",
-            "Selectivity of recipe survival for lineage depth",
-            "Standardised coefficient",
-            persistence_summary,
-            persistence_outcome_summary,
-        ),
-        (
-            "beta_extant_on_innovators_age_controlled",
-            "Selectivity of recipe survival for contributor count",
-            "Standardised coefficient",
-            persistence_summary,
-            persistence_outcome_summary,
-        ),
+        # (
+        #     "mean_recipe_ancestor_age",
+        #     "Mean age of final recipes' oldest ancestors",
+        #     "Timesteps",
+        #     fee_outcome_summary,
+        #     fee_outcome_summary,
+        # ),
+        # (
+        #     "beta_extant_on_depth_age_controlled",
+        #     "Selectivity of recipe survival for lineage depth",
+        #     "Standardised coefficient",
+        #     persistence_summary,
+        #     persistence_outcome_summary,
+        # ),
+        # (
+        #     "beta_extant_on_innovators_age_controlled",
+        #     "Selectivity of recipe survival for contributor count",
+        #     "Standardised coefficient",
+        #     persistence_summary,
+        #     persistence_outcome_summary,
+        # ),
         (
             "mean_n_dead_innovators",
-            "Mean number of dead innovators in final recipe ancestries",
+            "Mean number of dead contributors to final recipes",
             "Count",
             posthumous_summary,
             posthumous_outcome_summary,
-        ),
-        (
-            "spatial_structure_slope",
-            "Slope of library dissimilarity vs Manhattan distance",
-            "Slope",
-            spatial_summary,
-            spatial_outcome_summary,
         ),
     ]
     n_metric_cols = 3
@@ -1282,13 +1409,19 @@ def plot_population_level_metrics(
             linewidth=3,
             marker=None,
             errorbar=None,
+            legend=False,
             ax=fee_ax,
         )
         fee_ax.set(xlabel="$c$", ylabel=label, title="")
         sns.despine(ax=fee_ax, left=True, bottom=True)
 
         model_type, p_val = plot_yield_relationship(
-            yield_ax, outcome_df, metric, fee_label_order, metric_idx == 0
+            yield_ax,
+            outcome_df,
+            metric,
+            fee_label_order,
+            metric_idx == 0,
+            show_both_fits=show_both_fits,
         )
         yield_ax.set(xlabel=label, ylabel="Final population yield")
 
@@ -1303,6 +1436,12 @@ def plot_population_level_metrics(
             fontsize=12,
             fontweight="bold" if bold else "normal",
         )
+
+        # remove all legends
+        if fee_ax.legend_ is not None:
+            fee_ax.legend_.remove()
+        if yield_ax.legend_ is not None:
+            yield_ax.legend_.remove()
 
     for metric_idx in range(len(metric_specs), n_metric_rows * n_metric_cols):
         row = metric_idx // n_metric_cols
@@ -1320,83 +1459,87 @@ def plot_population_level_metrics(
 
 def main():
     data = load_data()
-    fee_label_map, fee_label_order, fee_palette = get_fee_plotting_config(
-        data["recipe_lineage"]
-    )
+    # fee_label_map, fee_label_order, fee_palette = get_fee_plotting_config(
+    #     data["recipe_lineage"]
+    # )
 
     filtered_pop_df = plot_performance_metrics(data["population"])
-    plot_final_performance_metrics(filtered_pop_df)
-    plot_preliminary_innovation_decay(data["raw_outputs"])
-    plot_agent_heatmaps(data["agent"])
-    plot_similarity(data["similarity_matrices"], np.sort(data["agent"]["fee"].unique()))
+    # plot_final_performance_metrics(
+    #     filtered_pop_df, data["population_run_summary"].copy()
+    # )
+    plot_final_performance_metrics_normalized_events(
+        filtered_pop_df, data["population_run_summary"].copy()
+    )
+    # plot_preliminary_innovation_decay(data["raw_outputs"])
+    # plot_agent_heatmaps(data["agent"])
+    # plot_similarity(data["similarity_matrices"], np.sort(data["agent"]["fee"].unique()))
 
-    (
-        extant_recipe_lineage_data,
-        fee_outcome_summary,
-        recombination_summary,
-        recombination_outcome_summary,
-    ) = build_recipe_plot_data(
-        data["population"].copy(),
-        data["recipe_lineage"].copy(),
-        data["recipe_recombination"].copy(),
-        fee_label_map,
-        fee_label_order,
-    )
-    (
-        specialisation_summary,
-        specialisation_outcome_summary,
-    ) = build_specialisation_plot_data(
-        data["agent"].copy(),
-        data["population"].copy(),
-        fee_label_map,
-        fee_label_order,
-    )
-    (
-        spatial_summary,
-        spatial_outcome_summary,
-    ) = build_spatial_structure_plot_data(
-        data["similarity_matrices"],
-        data["population"].copy(),
-        data["raw_outputs"],
-        fee_label_map,
-        fee_label_order,
-    )
-    (
-        persistence_summary,
-        persistence_outcome_summary,
-    ) = build_recipe_persistence_selectivity_plot_data(
-        data["recipe_descendant"].copy(),
-        data["population"].copy(),
-        data["raw_outputs"],
-        fee_label_map,
-        fee_label_order,
-    )
-    (
-        posthumous_summary,
-        posthumous_outcome_summary,
-    ) = build_posthumous_contribution_plot_data(
-        data["recipe_lineage"].copy(),
-        data["population"].copy(),
-        data["raw_outputs"],
-        fee_label_map,
-        fee_label_order,
-    )
+    # (
+    #     extant_recipe_lineage_data,
+    #     fee_outcome_summary,
+    #     recombination_summary,
+    #     recombination_outcome_summary,
+    # ) = build_recipe_plot_data(
+    #     data["population"].copy(),
+    #     data["population_run_summary"].copy(),
+    #     data["recipe_lineage"].copy(),
+    #     data["recipe_recombination"].copy(),
+    #     fee_label_map,
+    #     fee_label_order,
+    # )
+    # (
+    #     specialisation_summary,
+    #     specialisation_outcome_summary,
+    # ) = build_specialisation_plot_data(
+    #     data["agent"].copy(),
+    #     data["population"].copy(),
+    #     fee_label_map,
+    #     fee_label_order,
+    # )
+    # (
+    #     spatial_summary,
+    #     spatial_outcome_summary,
+    # ) = build_spatial_structure_plot_data(
+    #     data["similarity_matrices"],
+    #     data["population"].copy(),
+    #     data["raw_outputs"],
+    #     fee_label_map,
+    #     fee_label_order,
+    # )
+    # (
+    #     persistence_summary,
+    #     persistence_outcome_summary,
+    # ) = build_recipe_persistence_selectivity_plot_data(
+    #     data["recipe_descendant"].copy(),
+    #     data["population"].copy(),
+    #     data["raw_outputs"],
+    #     fee_label_map,
+    #     fee_label_order,
+    # )
+    # (
+    #     posthumous_summary,
+    #     posthumous_outcome_summary,
+    # ) = build_posthumous_contribution_plot_data(
+    #     data["recipe_lineage"].copy(),
+    #     data["population"].copy(),
+    #     data["raw_outputs"],
+    #     fee_label_map,
+    #     fee_label_order,
+    # )
 
-    plot_population_level_metrics(
-        fee_outcome_summary,
-        spatial_summary,
-        spatial_outcome_summary,
-        recombination_summary,
-        recombination_outcome_summary,
-        specialisation_summary,
-        specialisation_outcome_summary,
-        persistence_summary,
-        persistence_outcome_summary,
-        posthumous_summary,
-        posthumous_outcome_summary,
-        fee_label_order,
-        fee_palette,
-    )
+    # plot_population_level_metrics(
+    #     fee_outcome_summary,
+    #     recombination_summary,
+    #     recombination_outcome_summary,
+    #     specialisation_summary,
+    #     specialisation_outcome_summary,
+    #     persistence_summary,
+    #     persistence_outcome_summary,
+    #     posthumous_summary,
+    #     posthumous_outcome_summary,
+    #     fee_label_order,
+    #     fee_palette,
+    # )
 
 
 if __name__ == "__main__":
