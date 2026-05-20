@@ -309,9 +309,9 @@ def parse_args() -> argparse.Namespace:
         epilog=(
             "Examples:\n"
             "  python render_foraging_environment.py --rows 6 --cols 6 --max-foraging-level 5 "
-            "--output figures/foraging_environment.svg\n"
+            "--output figures/recipe_world_env/foraging_environment.svg\n"
             "  python render_foraging_environment.py --rows 8 --cols 5 --max-foraging-level 7 "
-            "--output figures/foraging_environment.png --no-agents"
+            "--output figures/recipe_world_env/foraging_environment.png --no-agents"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -333,7 +333,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output",
         type=Path,
-        default=Path("figures/foraging_environment.svg"),
+        default=Path("figures/recipe_world_env/foraging_environment.svg"),
         help="Output file path. The extension can be .svg, .png, .pdf, or another Matplotlib-supported format.",
     )
     parser.add_argument(

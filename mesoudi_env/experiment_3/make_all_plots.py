@@ -12,15 +12,15 @@ from matplotlib import pyplot as plt
 
 sns.set_style("whitegrid")
 
-DATA_DIR = Path("data/experiment_3")
-OUTPUT_DIR = Path("figures/experiment_3")
+DATA_DIR = Path("data/mesoudi_env/experiment_3")
+OUTPUT_DIR = Path("figures/mesoudi_env/experiment_3")
 LINEAGES_DIR = OUTPUT_DIR / "lineages"
 VIDEOS_DIR = OUTPUT_DIR / "videos"
 LINEAGES_DIR.mkdir(parents=True, exist_ok=True)
 VIDEOS_DIR.mkdir(parents=True, exist_ok=True)
 
-T = int(1e4)
-CGS_INTERVAL = 100
+T = int(2e3)
+CGS_INTERVAL = 25
 COLORS = ["xkcd:turquoise", "xkcd:periwinkle"]
 
 
@@ -74,18 +74,22 @@ for run_type in raw_data.keys():
     raw_data[run_type]["final_next_group_instance_ids"] = outputs[
         "final_next_group_instance_ids"
     ]
-    raw_data[run_type]["agent_yields"] = outputs["agent_yields"]
+    raw_data[run_type]["traits_known"] = outputs["traits_known"]
+
+    # print(run_type, outputs["traits_known"].shape, outputs["group_norm_values"].shape)
+    # print(run_type, outputs["group_norm_values"][:, -1, :].mean(axis=1))
 
 max_n_seeds = max(
     raw_data["real"]["group_norm_values"].shape[0],
     raw_data["neutral"]["group_norm_values"].shape[0],
 )
+print(max_n_seeds)
 sampled_timesteps = np.arange(0, T, CGS_INTERVAL)
 
 for run_type, data in raw_data.items():
     data["sampled_group_norm_values"] = data["group_norm_values"][:T, ::CGS_INTERVAL]
     data["sampled_grids"] = data["group_labels_grids"][:T, ::CGS_INTERVAL]
-    data["sampled_agent_yields"] = data["agent_yields"][:T, sampled_timesteps]
+    data["sampled_traits_known"] = data["traits_known"][:T, ::CGS_INTERVAL]
 
 
 def _configure_grid_axes(ax, grid_size, show_gridlines=False):
@@ -129,10 +133,12 @@ def compute_average_norm_values(norm_value_grids):
     return np.mean(norm_value_grids, axis=(1, 2))
 
 
-def build_group_labels_for_yield_history(group_labels_history, sampled_timesteps):
-    # `agent_yields[t]` is computed before the CA/group update, while
+def build_group_labels_for_traits_known_history(
+    group_labels_history, sampled_timesteps
+):
+    # `agent_traits_known[t]` is computed before the CA/group update, while
     # `group_labels_grids[t]` is saved after that update. To recover the groups
-    # that actually generated each yield vector, we therefore use the previous
+    # that actually generated each traits known vector, we therefore use the previous
     # recorded grid, with the all-zero initial grid standing in for t=0.
     aligned_group_labels = np.zeros(
         (len(sampled_timesteps),) + group_labels_history.shape[1:],
@@ -145,27 +151,27 @@ def build_group_labels_for_yield_history(group_labels_history, sampled_timesteps
     return aligned_group_labels
 
 
-def compute_group_average_yield_annotations(
-    agent_yields_history,
-    group_labels_for_yields,
+def compute_group_average_traits_known_annotations(
+    agent_traits_known_history,
+    group_labels_for_traits_known,
     max_n_groups,
 ):
     # Build one text label per non-empty group per frame, positioned at the
     # occupied tile closest to the group's centroid and showing that group's
-    # mean yield.
-    n_steps = agent_yields_history.shape[0]
-    flat_yields = agent_yields_history.reshape(n_steps, -1)
-    flat_group_labels = group_labels_for_yields.reshape(n_steps, -1)
-    rows, cols = np.indices(group_labels_for_yields.shape[1:])
+    # mean traits_known.
+    n_steps = agent_traits_known_history.shape[0]
+    flat_traits_known = agent_traits_known_history.reshape(n_steps, -1)
+    flat_group_labels = group_labels_for_traits_known.reshape(n_steps, -1)
+    rows, cols = np.indices(group_labels_for_traits_known.shape[1:])
     flat_rows = np.broadcast_to(rows.reshape(1, -1), flat_group_labels.shape)
     flat_cols = np.broadcast_to(cols.reshape(1, -1), flat_group_labels.shape)
     annotations = []
 
     for t in range(n_steps):
         counts = np.bincount(flat_group_labels[t], minlength=max_n_groups)
-        total_yields = np.bincount(
+        total_traits_known = np.bincount(
             flat_group_labels[t],
-            weights=flat_yields[t],
+            weights=flat_traits_known[t],
             minlength=max_n_groups,
         )
         row_totals = np.bincount(
@@ -191,7 +197,7 @@ def compute_group_average_yield_annotations(
                 (
                     flat_cols[t, label_tile_idx],
                     flat_rows[t, label_tile_idx],
-                    f"{total_yields[group_id] / counts[group_id]:.1f}",
+                    f"{total_traits_known[group_id] / counts[group_id]:.1f}",
                 )
             )
         annotations.append(frame_annotations)
@@ -307,7 +313,6 @@ def plot_group_lineage(
                 instance_size_series[instance_id, start_steps]
                 + instance_size_series[instance_id, end_steps]
             )
-            print(segment_sizes)
             linewidths = scale_sizes(segment_sizes, 0.0, 8.0)
             colors = [color]
             collection = LineCollection(
@@ -408,13 +413,13 @@ def plot_average_norm_values_over_time(ts, real_norm_values, neutral_norm_values
     return fig, ax
 
 
-def plot_yields(ts, real_yields, neutral_yields):
+def plot_traits_known(ts, real_traits_known, neutral_traits_known):
     # Save one line per seed on a shared set of axes.
     fig, ax = plt.subplots(figsize=(6, 4))
 
-    max_n_seeds = max(real_yields.shape[0], neutral_yields.shape[0])
+    max_n_seeds = max(real_traits_known.shape[0], neutral_traits_known.shape[0])
     for seed_idx in range(max_n_seeds):
-        for vals, color in zip([real_yields, neutral_yields], COLORS):
+        for vals, color in zip([real_traits_known, neutral_traits_known], COLORS):
             if seed_idx < vals.shape[0]:
                 sns.lineplot(
                     x=ts,
@@ -424,7 +429,10 @@ def plot_yields(ts, real_yields, neutral_yields):
                     alpha=0.5,
                 )
 
-    means = [np.nanmean(real_yields, axis=0), np.nanmean(neutral_yields, axis=0)]
+    means = [
+        np.nanmean(real_traits_known, axis=0),
+        np.nanmean(neutral_traits_known, axis=0),
+    ]
     for mean_val, color in zip(means, COLORS):
         sns.lineplot(
             x=ts,
@@ -437,8 +445,8 @@ def plot_yields(ts, real_yields, neutral_yields):
 
     ax.set(
         xlabel="t",
-        ylabel="yield",
-        title="Population-average yield over time",
+        ylabel="traits known",
+        title="Population-average traits known over time",
     )
 
     # remove legend
@@ -448,7 +456,9 @@ def plot_yields(ts, real_yields, neutral_yields):
     return fig, ax
 
 
-def plot_norms_vs_yields(real_norms, real_yields, neutral_norms, neutral_yields):
+def plot_norms_vs_traits_known(
+    real_norms, real_traits_known, neutral_norms, neutral_traits_known
+):
     real_norms_final = real_norms[:, -max(1, real_norms.shape[1] // 10) :].mean(axis=1)
     real_norms_avg = real_norms.mean(axis=1)
     neutral_norms_final = neutral_norms[
@@ -459,25 +469,27 @@ def plot_norms_vs_yields(real_norms, real_yields, neutral_norms, neutral_yields)
     fig, axs = plt.subplots(1, 2, figsize=(8, 4), sharey=True)
 
     sns.scatterplot(
-        x=real_norms_final, y=real_yields, ax=axs[0], color=COLORS[0], s=100
+        x=real_norms_final, y=real_traits_known, ax=axs[0], color=COLORS[0], s=100
     )
     sns.scatterplot(
-        x=neutral_norms_final, y=neutral_yields, ax=axs[0], color=COLORS[1], s=100
+        x=neutral_norms_final, y=neutral_traits_known, ax=axs[0], color=COLORS[1], s=100
     )
     axs[0].set(
         xlabel="$c$",
-        ylabel="yield",
-        title="Population-average $c$ (final 10% of timesteps)\nvs final population-average yield",
+        ylabel="traits known",
+        title="Population-average $c$ (final 10% of timesteps)\nvs final population-average traits known",
     )
 
-    sns.scatterplot(x=real_norms_avg, y=real_yields, ax=axs[1], color=COLORS[0], s=100)
     sns.scatterplot(
-        x=neutral_norms_avg, y=neutral_yields, ax=axs[1], color=COLORS[1], s=100
+        x=real_norms_avg, y=real_traits_known, ax=axs[1], color=COLORS[0], s=100
+    )
+    sns.scatterplot(
+        x=neutral_norms_avg, y=neutral_traits_known, ax=axs[1], color=COLORS[1], s=100
     )
     axs[1].set(
         xlabel="$c$",
-        ylabel="yield",
-        title="Population-average $c$ (all timesteps)\nvs final population-average yield",
+        ylabel="traits known",
+        title="Population-average $c$ (all timesteps)\nvs final population-average traits known",
     )
 
     sns.despine(ax=axs[0], left=True, bottom=True)
@@ -518,7 +530,7 @@ def render_grid_video(
     output_path,
     fps=2,
     boundary_masks=None,
-    group_yield_annotations=None,
+    group_traits_known_annotations=None,
 ):
     # Render a GIF from already-prepared per-frame norm_value grids plus an
     # average-norm_value time series for the annotation text.
@@ -569,10 +581,12 @@ def render_grid_video(
         bbox={"facecolor": "white", "alpha": 0.8, "edgecolor": "none", "pad": 2},
         animated=True,
     )
-    group_yield_texts = []
-    if group_yield_annotations is not None:
-        max_labels = max(len(frame_labels) for frame_labels in group_yield_annotations)
-        group_yield_texts = [
+    group_traits_known_texts = []
+    if group_traits_known_annotations is not None:
+        max_labels = max(
+            len(frame_labels) for frame_labels in group_traits_known_annotations
+        )
+        group_traits_known_texts = [
             ax.text(
                 0,
                 0,
@@ -604,9 +618,9 @@ def render_grid_video(
             )
         timestamp.set_text(f"t={frame_idx * CGS_INTERVAL}")
         average_text.set_text(f"avg p={average_norm_values[frame_idx]:.3f}")
-        if group_yield_annotations is not None:
-            frame_labels = group_yield_annotations[frame_idx]
-            for label_idx, text_artist in enumerate(group_yield_texts):
+        if group_traits_known_annotations is not None:
+            frame_labels = group_traits_known_annotations[frame_idx]
+            for label_idx, text_artist in enumerate(group_traits_known_texts):
                 if label_idx < len(frame_labels):
                     col, row, label = frame_labels[label_idx]
                     text_artist.set_position((col, row))
@@ -620,9 +634,9 @@ def render_grid_video(
                 boundary_overlay,
                 timestamp,
                 average_text,
-                *group_yield_texts,
+                *group_traits_known_texts,
             )
-        return image, timestamp, average_text, *group_yield_texts
+        return image, timestamp, average_text, *group_traits_known_texts
 
     anim = animation.FuncAnimation(
         fig,
@@ -637,9 +651,9 @@ def render_grid_video(
     return output_path
 
 
-lineage_seeds = [0, 2, 11]
+lineage_seeds = list(range(10))
 lineage_fig, lineage_axs = plt.subplots(
-    1, len(lineage_seeds), figsize=(20, 4), sharey=True
+    1, len(lineage_seeds), figsize=(30, 4), sharey=True
 )
 
 processed_data = {"real": defaultdict(list), "neutral": defaultdict(list)}
@@ -657,8 +671,8 @@ for seed_idx in range(max_n_seeds):
                     processed_data[run_type]["norm_value_grids"][-1]
                 )
             )
-            processed_data[run_type]["population_average_yields"].append(
-                raw_data[run_type]["sampled_agent_yields"][seed_idx].mean(axis=1)
+            processed_data[run_type]["population_average_traits_known"].append(
+                raw_data[run_type]["sampled_traits_known"][seed_idx].mean(axis=1)
             )
             if run_type == "real" and seed_idx in lineage_seeds:
                 full_instance_norm_series = build_group_instance_norm_series(
@@ -687,26 +701,28 @@ for seed_idx in range(max_n_seeds):
                 )
                 sns.despine(ax=lineage_axs[ax_idx], left=True, bottom=True)
 
-                # boundary_masks = build_boundary_masks(
-                #     raw_data[run_type]["sampled_grids"][seed_idx]
-                # )
-                # yields_group_labels = build_group_labels_for_yield_history(
-                #     raw_data[run_type]["group_labels_grids"][seed_idx],
-                #     sampled_timesteps,
-                # )
-                # group_yield_annotations = compute_group_average_yield_annotations(
-                #     raw_data[run_type]["sampled_agent_yields"][seed_idx],
-                #     yields_group_labels,
-                #     max_n_groups=raw_data[run_type]["group_norm_values"].shape[2],
-                # )
-                # render_grid_video(
-                #     processed_data[run_type]["norm_value_grids"][-1],
-                #     processed_data[run_type]["average_norm_values"][-1],
-                #     VIDEOS_DIR / f"seed_{seed_idx}.gif",
-                #     fps=10,
-                #     boundary_masks=boundary_masks,
-                #     group_yield_annotations=group_yield_annotations,
-                # )
+                boundary_masks = build_boundary_masks(
+                    raw_data[run_type]["sampled_grids"][seed_idx]
+                )
+                traits_known_group_labels = build_group_labels_for_traits_known_history(
+                    raw_data[run_type]["group_labels_grids"][seed_idx],
+                    sampled_timesteps,
+                )
+                group_traits_known_annotations = (
+                    compute_group_average_traits_known_annotations(
+                        raw_data[run_type]["sampled_traits_known"][seed_idx],
+                        traits_known_group_labels,
+                        max_n_groups=raw_data[run_type]["group_norm_values"].shape[2],
+                    )
+                )
+                render_grid_video(
+                    processed_data[run_type]["norm_value_grids"][-1],
+                    processed_data[run_type]["average_norm_values"][-1],
+                    VIDEOS_DIR / f"seed_{seed_idx}.gif",
+                    fps=10,
+                    boundary_masks=boundary_masks,
+                    group_traits_known_annotations=group_traits_known_annotations,
+                )
         except IndexError:
             print(
                 f"Warning: Seed index {seed_idx} is out of bounds for run type {run_type}. Skipping this seed for this run type."
@@ -722,23 +738,25 @@ for run_type in ["real", "neutral"]:
         ]  # trim to shortest length
 
 final_window_len = max(
-    1, processed_data_np["real"]["population_average_yields"].shape[1] // 10
+    1, processed_data_np["real"]["population_average_traits_known"].shape[1] // 10
 )
 for run_type in ["real", "neutral"]:
-    processed_data_np[run_type]["final_window_average_yields"] = processed_data_np[
-        run_type
-    ]["population_average_yields"][:, -final_window_len:].mean(axis=1)
+    processed_data_np[run_type]["final_window_average_traits_known"] = (
+        processed_data_np[run_type]["population_average_traits_known"][
+            :, -final_window_len:
+        ].mean(axis=1)
+    )
 
-kept_seed_mask = np.ones(max_n_seeds, dtype=bool)
-kept_seed_mask[
-    np.argsort(processed_data_np["real"]["final_window_average_yields"])[:3]
-] = False
-for key in [
-    "average_norm_values",
-    "population_average_yields",
-    "final_window_average_yields",
-]:
-    processed_data_np["real"][key] = processed_data_np["real"][key][kept_seed_mask]
+# kept_seed_mask = np.ones(max_n_seeds, dtype=bool)
+# kept_seed_mask[
+#     np.argsort(processed_data_np["real"]["final_window_average_traits_known"])[:3]
+# ] = False
+# for key in [
+#     "average_norm_values",
+#     "population_average_traits_known",
+#     "final_window_average_traits_known",
+# ]:
+#     processed_data_np["real"][key] = processed_data_np["real"][key][kept_seed_mask]
 
 fig, ax = plot_average_norm_values_over_time(
     sampled_timesteps,
@@ -747,19 +765,19 @@ fig, ax = plot_average_norm_values_over_time(
 )
 save_figure(fig, "average_group_norm_values")
 
-fig, ax = plot_yields(
+fig, ax = plot_traits_known(
     sampled_timesteps,
-    processed_data_np["real"]["population_average_yields"],
-    processed_data_np["neutral"]["population_average_yields"],
+    processed_data_np["real"]["population_average_traits_known"],
+    processed_data_np["neutral"]["population_average_traits_known"],
 )
-save_figure(fig, "population_average_yields")
+save_figure(fig, "population_average_traits_known")
 
-fig, axs = plot_norms_vs_yields(
+fig, axs = plot_norms_vs_traits_known(
     processed_data_np["real"]["average_norm_values"],
-    processed_data_np["real"]["final_window_average_yields"],
+    processed_data_np["real"]["final_window_average_traits_known"],
     processed_data_np["neutral"]["average_norm_values"],
-    processed_data_np["neutral"]["final_window_average_yields"],
+    processed_data_np["neutral"]["final_window_average_traits_known"],
 )
-save_figure(fig, "norms_vs_yields")
+save_figure(fig, "norms_vs_traits_known")
 
 print(f"Saved plots to {OUTPUT_DIR.resolve()}")

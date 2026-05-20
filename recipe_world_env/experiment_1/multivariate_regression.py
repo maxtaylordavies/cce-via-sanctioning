@@ -20,13 +20,17 @@ from src.utils import save_fig as save_fig_
 save_fig = lambda fig, name, subfolder=None: save_fig_(
     fig,
     name,
-    subfolder=(f"experiment_1/{subfolder}" if subfolder else "experiment_1"),
+    subfolder=(
+        f"experiment_1/recipe_world_env/{subfolder}"
+        if subfolder
+        else "experiment_1/recipe_world_env"
+    ),
 )
 
 sns.set_context("paper", font_scale=1.2)
 sns.set_style("whitegrid")
 
-DATA_DIR = Path("data/experiment_1")
+DATA_DIR = Path("data/recipe_world_env/experiment_1")
 
 _husl = sns.color_palette("husl", 6)
 BAR_COLORS = {

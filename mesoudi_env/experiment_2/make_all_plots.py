@@ -12,13 +12,13 @@ from matplotlib import pyplot as plt
 sns.set_context("paper", font_scale=1.2)
 sns.set_style("whitegrid")
 
-DATA_DIR = Path("data/experiment_2")
-OUTPUT_DIR = Path("figures/experiment_2")
+DATA_DIR = Path("data/mesoudi_env/experiment_2")
+OUTPUT_DIR = Path("figures/mesoudi_env/experiment_2")
 LINEAGES_DIR = OUTPUT_DIR / "lineages"
 LINEAGES_DIR.mkdir(parents=True, exist_ok=True)
 
-T = int(1e4)
-CGS_INTERVAL = 10
+T = int(2.5e3)
+CGS_INTERVAL = 20
 COLORS = ["xkcd:turquoise", "xkcd:periwinkle"]
 
 
@@ -72,7 +72,7 @@ for run_type in raw_data.keys():
     raw_data[run_type]["final_next_group_instance_ids"] = outputs[
         "final_next_group_instance_ids"
     ]
-    raw_data[run_type]["agent_yields"] = outputs["agent_yields"]
+    raw_data[run_type]["mean_traits_known"] = outputs["mean_traits_known"]
 
 max_n_seeds = max(
     raw_data["real"]["group_norm_values"].shape[0],
@@ -81,9 +81,9 @@ max_n_seeds = max(
 sampled_timesteps = np.arange(0, T, CGS_INTERVAL)
 
 for run_type, data in raw_data.items():
-    data["sampled_group_norm_values"] = data["group_norm_values"][:T, ::CGS_INTERVAL]
-    data["sampled_grids"] = data["group_labels_grids"][:T, ::CGS_INTERVAL]
-    data["sampled_agent_yields"] = data["agent_yields"][:T, sampled_timesteps]
+    data["sampled_group_norm_values"] = data["group_norm_values"][:, ::CGS_INTERVAL]
+    data["sampled_grids"] = data["group_labels_grids"][:, ::CGS_INTERVAL]
+    data["sampled_mean_traits_known"] = data["mean_traits_known"][:, ::CGS_INTERVAL]
 
 
 def build_norm_value_grids(grids, group_norm_values_history):
@@ -268,6 +268,9 @@ def plot_group_lineage(
 
 
 def plot_average_norm_values_over_time(ts, real_norm_values, neutral_norm_values):
+    print(real_norm_values)
+    print(neutral_norm_values)
+
     # Save one line per seed on a shared set of axes.
     fig, ax = plt.subplots(figsize=(6, 4))
 
@@ -312,13 +315,13 @@ def plot_average_norm_values_over_time(ts, real_norm_values, neutral_norm_values
     return fig, ax
 
 
-def plot_yields(ts, real_yields, neutral_yields):
+def plot_mean_traits_known(ts, real_vals, neutral_vals):
     # Save one line per seed on a shared set of axes.
     fig, ax = plt.subplots(figsize=(6, 4))
 
-    max_n_seeds = max(real_yields.shape[0], neutral_yields.shape[0])
+    max_n_seeds = max(real_vals.shape[0], neutral_vals.shape[0])
     for seed_idx in range(max_n_seeds):
-        for vals, color in zip([real_yields, neutral_yields], COLORS):
+        for vals, color in zip([real_vals, neutral_vals], COLORS):
             if seed_idx < vals.shape[0]:
                 sns.lineplot(
                     x=ts,
@@ -328,7 +331,7 @@ def plot_yields(ts, real_yields, neutral_yields):
                     alpha=0.5,
                 )
 
-    means = [np.nanmean(real_yields, axis=0), np.nanmean(neutral_yields, axis=0)]
+    means = [np.nanmean(real_vals, axis=0), np.nanmean(neutral_vals, axis=0)]
     for mean_val, color in zip(means, COLORS):
         sns.lineplot(
             x=ts,
@@ -341,8 +344,8 @@ def plot_yields(ts, real_yields, neutral_yields):
 
     ax.set(
         xlabel="t",
-        ylabel="yield",
-        title="Population-average yield over time",
+        ylabel="mean traits known",
+        title="Population-average # traits known over time",
     )
 
     # remove legend
@@ -352,7 +355,9 @@ def plot_yields(ts, real_yields, neutral_yields):
     return fig, ax
 
 
-def plot_norms_vs_yields(real_norms, real_yields, neutral_norms, neutral_yields):
+def plot_norms_vs_traits_known(
+    real_norms, real_traits_known, neutral_norms, neutral_traits_known
+):
     real_norms_final = real_norms[:, -max(1, real_norms.shape[1] // 10) :].mean(axis=1)
     real_norms_avg = real_norms.mean(axis=1)
     neutral_norms_final = neutral_norms[
@@ -363,25 +368,27 @@ def plot_norms_vs_yields(real_norms, real_yields, neutral_norms, neutral_yields)
     fig, axs = plt.subplots(1, 2, figsize=(8, 4), sharey=True)
 
     sns.scatterplot(
-        x=real_norms_final, y=real_yields, ax=axs[0], color=COLORS[0], s=100
+        x=real_norms_final, y=real_traits_known, ax=axs[0], color=COLORS[0], s=100
     )
     sns.scatterplot(
-        x=neutral_norms_final, y=neutral_yields, ax=axs[0], color=COLORS[1], s=100
+        x=neutral_norms_final, y=neutral_traits_known, ax=axs[0], color=COLORS[1], s=100
     )
     axs[0].set(
         xlabel="$c$",
         ylabel="yield",
-        title="Population-average $c$ (final 10% of timesteps)\nvs final population-average yield",
+        title="Population-average $c$ (final 10% of timesteps)\nvs final population-average # traits known",
     )
 
-    sns.scatterplot(x=real_norms_avg, y=real_yields, ax=axs[1], color=COLORS[0], s=100)
     sns.scatterplot(
-        x=neutral_norms_avg, y=neutral_yields, ax=axs[1], color=COLORS[1], s=100
+        x=real_norms_avg, y=real_traits_known, ax=axs[1], color=COLORS[0], s=100
+    )
+    sns.scatterplot(
+        x=neutral_norms_avg, y=neutral_traits_known, ax=axs[1], color=COLORS[1], s=100
     )
     axs[1].set(
         xlabel="$c$",
         ylabel="yield",
-        title="Population-average $c$ (all timesteps)\nvs final population-average yield",
+        title="Population-average $c$ (all timesteps)\nvs final population-average # traits known",
     )
 
     sns.despine(ax=axs[0], left=True, bottom=True)
@@ -391,7 +398,7 @@ def plot_norms_vs_yields(real_norms, real_yields, neutral_norms, neutral_yields)
     return fig, axs
 
 
-lineage_seeds = [0, 3, 9]
+lineage_seeds = [0, 1, 2]
 lineage_fig, lineage_axs = plt.subplots(
     1, len(lineage_seeds), figsize=(20, 4), sharey=True
 )
@@ -411,8 +418,8 @@ for seed_idx in range(max_n_seeds):
                     processed_data[run_type]["norm_value_grids"][-1]
                 )
             )
-            processed_data[run_type]["population_average_yields"].append(
-                raw_data[run_type]["sampled_agent_yields"][seed_idx].mean(axis=1)
+            processed_data[run_type]["population_average_traits_known"].append(
+                raw_data[run_type]["sampled_mean_traits_known"][seed_idx]
             )
             if run_type == "real" and seed_idx in lineage_seeds:
                 full_instance_norm_series = build_group_instance_norm_series(
@@ -454,23 +461,14 @@ for run_type in ["real", "neutral"]:
         ]  # trim to shortest length
 
 final_window_len = max(
-    1, processed_data_np["real"]["population_average_yields"].shape[1] // 10
+    1, processed_data_np["real"]["population_average_traits_known"].shape[1] // 10
 )
 for run_type in ["real", "neutral"]:
-    processed_data_np[run_type]["final_window_average_yields"] = processed_data_np[
-        run_type
-    ]["population_average_yields"][:, -final_window_len:].mean(axis=1)
-
-kept_seed_mask = np.ones(max_n_seeds, dtype=bool)
-kept_seed_mask[
-    np.argsort(processed_data_np["real"]["final_window_average_yields"])[:3]
-] = False
-for key in [
-    "average_norm_values",
-    "population_average_yields",
-    "final_window_average_yields",
-]:
-    processed_data_np["real"][key] = processed_data_np["real"][key][kept_seed_mask]
+    processed_data_np[run_type]["final_window_average_traits_known"] = (
+        processed_data_np[run_type]["population_average_traits_known"][
+            :, -final_window_len:
+        ].mean(axis=1)
+    )
 
 fig, ax = plot_average_norm_values_over_time(
     sampled_timesteps,
@@ -479,19 +477,19 @@ fig, ax = plot_average_norm_values_over_time(
 )
 save_figure(fig, "average_group_norm_values")
 
-fig, ax = plot_yields(
+fig, ax = plot_mean_traits_known(
     sampled_timesteps,
-    processed_data_np["real"]["population_average_yields"],
-    processed_data_np["neutral"]["population_average_yields"],
+    processed_data_np["real"]["population_average_traits_known"],
+    processed_data_np["neutral"]["population_average_traits_known"],
 )
-save_figure(fig, "population_average_yields")
+save_figure(fig, "population_average_traits_known")
 
-fig, axs = plot_norms_vs_yields(
+fig, axs = plot_norms_vs_traits_known(
     processed_data_np["real"]["average_norm_values"],
-    processed_data_np["real"]["final_window_average_yields"],
+    processed_data_np["real"]["final_window_average_traits_known"],
     processed_data_np["neutral"]["average_norm_values"],
-    processed_data_np["neutral"]["final_window_average_yields"],
+    processed_data_np["neutral"]["final_window_average_traits_known"],
 )
-save_figure(fig, "norms_vs_yields")
+save_figure(fig, "norms_vs_traits_known")
 
 print(f"Saved plots to {OUTPUT_DIR.resolve()}")

@@ -4,7 +4,7 @@ import os
 import numpy as np
 import pandas as pd
 
-DATA_DIR = Path("data/experiment_1")
+DATA_DIR = Path("data/recipe_world_env/experiment_1")
 
 
 def get_gini(values):
