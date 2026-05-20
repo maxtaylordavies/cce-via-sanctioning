@@ -75,6 +75,7 @@ for seed_idx, seed in enumerate(outputs["seeds"]):
             )
 
 df = pd.DataFrame(rows)
+
 min_fee, max_fee = df["fee"].min(), df["fee"].max()
 x_lims = (min_fee - 0.2, max_fee + 0.2)
 lower_goldilocks, upper_goldilocks = 0.5, 2.0
