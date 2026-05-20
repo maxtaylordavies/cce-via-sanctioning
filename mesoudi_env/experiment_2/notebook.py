@@ -7,7 +7,7 @@ from tqdm import tqdm
 
 ROLE_INNOVATE, ROLE_IMITATE = 0, 1
 L = 100
-MAX_TOTAL_L = 5000
+MAX_TOTAL_L = 10000
 
 
 @jax.jit
@@ -267,6 +267,7 @@ def run_simulation_loop(
             next_group_instance_id,
             group_parent_instance_ids,
             group_birth_timesteps,
+            traits_gained_since_cgs,
         ) = carry
 
         # get new keys
@@ -276,6 +277,7 @@ def run_simulation_loop(
         deaths = jax.random.bernoulli(death_key, p_d, shape=(N,))
         all_traits = jnp.where(deaths[:, None], 0, all_traits)
         all_q_vals = jnp.where(deaths[:, None], init_q, all_q_vals)
+        traits_gained_since_cgs = jnp.where(deaths, 0.0, traits_gained_since_cgs)
 
         # agents select roles
         role_probs = jax.nn.softmax(all_q_vals / choice_beta, axis=1)
@@ -289,6 +291,9 @@ def run_simulation_loop(
             update_key, all_traits, all_roles, group_labels_grid, curr_Ls
         )
         new_trait_payoffs = compute_trait_payoffs(new_all_traits, b)
+        updated_traits_gained_since_cgs = traits_gained_since_cgs + (
+            n_innovated + n_imitated
+        ).astype(jnp.float32)
 
         # compute role rewards and costs
         rewards = new_trait_payoffs - curr_trait_payoffs
@@ -316,8 +321,12 @@ def run_simulation_loop(
         # mean_prop_known = (all_traits * mask.reshape(1, -1)).sum(axis=1).mean() / L
 
         group_num_traits_known = _group_average_values(
-            base_group_grid, per_agent_traits_known
+            group_labels_grid, per_agent_traits_known
         )
+        group_new_traits_gained = _group_average_values(
+            group_labels_grid, updated_traits_gained_since_cgs
+        )
+        group_trait_gain_scores = group_new_traits_gained / curr_Ls.astype(jnp.float32)
         group_prop_traits_known = group_num_traits_known / curr_Ls
         unlock = (group_prop_traits_known >= 0.9) & (curr_Ls < MAX_TOTAL_L)
         new_Ls = jnp.where(unlock, curr_Ls + L, curr_Ls)
@@ -345,7 +354,7 @@ def run_simulation_loop(
                 t,
                 group_labels_grid,
                 group_norm_values,
-                group_num_traits_known,
+                group_trait_gain_scores,
                 group_instance_ids_by_label,
                 next_group_instance_id,
                 group_parent_instance_ids,
@@ -361,6 +370,11 @@ def run_simulation_loop(
             group_norm_values,
             group_instance_ids_by_label,
         )
+        next_traits_gained_since_cgs = jnp.where(
+            should_run_group_selection,
+            jnp.zeros_like(updated_traits_gained_since_cgs),
+            updated_traits_gained_since_cgs,
+        )
 
         return (
             key,
@@ -373,6 +387,7 @@ def run_simulation_loop(
             next_group_instance_id,
             group_parent_instance_ids,
             group_birth_timesteps,
+            next_traits_gained_since_cgs,
         ), (
             mean_traits_known,
             group_norm_values,
@@ -407,6 +422,7 @@ def run_simulation_loop(
         next_group_instance_id,
         group_parent_instance_ids,
         group_birth_timesteps,
+        jnp.zeros(N, dtype=jnp.float32),  # traits_gained_since_cgs
     )
 
     carry, metrics = jax.lax.scan(body_fn, carry, jnp.arange(T))
@@ -414,7 +430,7 @@ def run_simulation_loop(
     return (*metrics, carry[7], carry[8], carry[9])
 
 
-seeds = list(range(10))
+seeds = list(range(5))
 grid_length, T = 30, int(2.5e3)
 
 all_mean_traits_known = []
