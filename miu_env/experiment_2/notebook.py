@@ -6,53 +6,169 @@ import numpy as np
 from tqdm import tqdm
 
 ROLE_INNOVATE, ROLE_IMITATE = 0, 1
-L = 100
-MAX_TOTAL_L = 10000
+
+p_max = 100
+l_max = 100
 
 
-@jax.jit
-def compute_trait_payoffs(all_traits, b):
-    return all_traits.sum(axis=1) * b
+def get_increment(l):
+    tmp = 0
+    for j in range(1, l + 1):
+        tmp += 0.95 ** (l - j)
+    tmp *= 0.05 / (1 - (0.95**l_max))
+    return tmp * p_max
 
 
-@jax.jit
-def innovate(key, traits, curr_L, p_i):
-    idx_key, flip_key = jax.random.split(key)
-    idx = jax.random.randint(idx_key, (), 0, curr_L)
-    success = (traits[idx] == 0) & jax.random.bernoulli(flip_key, p_i)
-    new_val = jnp.where(success, 1, traits[idx])
-    return traits.at[idx].set(new_val), success.astype(int)
+increments = jnp.array([0] + [get_increment(l) for l in range(1, l_max + 1)])
 
 
-# @jax.jit
-# def imitate(key, all_traits, can_imitate, agent_idx, curr_L):
-#     demonstrator_key, trait_key = jax.random.split(key)
-#     p_demonstrator = can_imitate[agent_idx] / can_imitate[agent_idx].sum()
-#     demonstrator_idx = jax.random.choice(
-#         demonstrator_key, all_traits.shape[0], p=p_demonstrator
-#     )
-#     trait_idx = jax.random.randint(trait_key, (), 0, curr_L)
-#     curr_val = all_traits[agent_idx, trait_idx]
-#     new_val = all_traits[demonstrator_idx, trait_idx]
-#     return all_traits[agent_idx].at[trait_idx].set(curr_val | new_val)
+def exploit(agent_arm_levels, agent_arm_payoff_estimates, full_rewards):
+    arm_idx = jnp.argmax(agent_arm_payoff_estimates)
+    arm_level = agent_arm_levels[arm_idx]
+    payoff = full_rewards[arm_idx, arm_level]
+    return payoff, agent_arm_payoff_estimates.at[arm_idx].set(payoff)
 
 
-@jax.jit
-def imitate(key, all_traits, can_imitate, agent_idx, p_c):
-    # trait_mask = jax.random.bernoulli(key, p_c, shape=all_traits.shape)
-    # trait_mask = jnp.ones_like(all_traits, dtype=jnp.bool)
-    # copy_mask = can_imitate[agent_idx].reshape(-1, 1) & trait_mask
-    # copied_traits = (all_traits * copy_mask).sum(axis=0) > 0
-    copied_traits = (all_traits * can_imitate.reshape(-1, 1)).sum(axis=0) > 0
-    new = all_traits[agent_idx] | copied_traits
-    n_changed = (new & ~all_traits[agent_idx]).sum()
-    return new, n_changed
+def explore(key, agent_arm_levels, agent_arm_payoff_estimates, full_rewards):
+    unknown_mask = agent_arm_levels == 0
+    n_unknown = unknown_mask.sum()
+
+    def learn_new_arm():
+        p_arm = unknown_mask / n_unknown
+        arm_idx = jax.random.choice(key, full_rewards.shape[0], p=p_arm)
+        payoff = full_rewards[arm_idx, 1]
+        return (
+            agent_arm_levels.at[arm_idx].set(1),
+            agent_arm_payoff_estimates.at[arm_idx].set(payoff),
+            True,
+        )
+
+    def do_nothing():
+        return agent_arm_levels, agent_arm_payoff_estimates, False
+
+    return jax.lax.cond(n_unknown > 0, learn_new_arm, do_nothing)
 
 
-@partial(jax.jit, static_argnames=("grid_length", "T"))
+def refine(key, agent_arm_levels, agent_arm_payoff_estimates, full_rewards):
+    eligible_mask = (agent_arm_levels > 0) & (agent_arm_levels < l_max)
+    n_eligible = eligible_mask.sum()
+
+    def refine_weighted_arm():
+        arm_weights = jnp.where(
+            eligible_mask, jnp.maximum(agent_arm_payoff_estimates, 0.0), 0.0
+        )
+        total_arm_weight = arm_weights.sum()
+
+        def sample_weighted_arm():
+            p_arm = arm_weights / total_arm_weight
+            return jax.random.choice(key, full_rewards.shape[0], p=p_arm)
+
+        def sample_uniform_eligible_arm():
+            p_arm = eligible_mask / n_eligible
+            return jax.random.choice(key, full_rewards.shape[0], p=p_arm)
+
+        arm_idx = jax.lax.cond(
+            total_arm_weight > 0,
+            sample_weighted_arm,
+            sample_uniform_eligible_arm,
+        )
+
+        # update the arm level and payoff estimate for the selected arm
+        arm_level = agent_arm_levels[arm_idx]
+        payoff = full_rewards[arm_idx, arm_level + 1]
+        return (
+            agent_arm_levels.at[arm_idx].set(arm_level + 1),
+            agent_arm_payoff_estimates.at[arm_idx].set(payoff),
+            True,
+        )
+
+    def do_nothing():
+        return agent_arm_levels, agent_arm_payoff_estimates, False
+
+    return jax.lax.cond(n_eligible > 0, refine_weighted_arm, do_nothing)
+
+
+def innovate(key, agent_arm_levels, agent_arm_payoff_estimates, full_rewards):
+    keys = jax.random.split(key, 2)
+    op = jax.random.bernoulli(keys[0])
+    return jax.lax.cond(
+        op,
+        lambda: explore(
+            keys[1], agent_arm_levels, agent_arm_payoff_estimates, full_rewards
+        ),
+        lambda: refine(
+            keys[1], agent_arm_levels, agent_arm_payoff_estimates, full_rewards
+        ),
+    )
+
+
+def imitate(
+    key,
+    all_agent_arm_levels,
+    all_agent_arm_payoff_estimates,
+    can_imitate,
+    agent_idx,
+):
+    neighbour_key, arm_key = jax.random.split(key)
+    p_neighbour = can_imitate / can_imitate.sum()  # normalise to get probabilities
+    neighbour_idx = jax.random.choice(
+        neighbour_key, all_agent_arm_levels.shape[0], p=p_neighbour
+    )
+
+    neighbour_arm_levels = all_agent_arm_levels[neighbour_idx]
+    neighbour_payoff_estimates = all_agent_arm_payoff_estimates[neighbour_idx]
+    arm_weights = jnp.where(
+        neighbour_arm_levels > 0, jnp.maximum(neighbour_payoff_estimates, 0.0), 0.0
+    )
+    total_arm_weight = arm_weights.sum()
+
+    def sample_weighted_arm():
+        p_arm = arm_weights / total_arm_weight
+        return jax.random.choice(arm_key, all_agent_arm_levels.shape[1], p=p_arm)
+
+    def sample_uniform_arm():
+        return jax.random.randint(arm_key, (), 0, all_agent_arm_levels.shape[1])
+
+    arm_idx = jax.lax.cond(
+        total_arm_weight > 0,
+        sample_weighted_arm,
+        sample_uniform_arm,
+    )
+
+    # only accept if the new level is higher than the current level for that arm
+    new_level = all_agent_arm_levels[neighbour_idx, arm_idx]
+    new_payoff = all_agent_arm_payoff_estimates[neighbour_idx, arm_idx]
+    current_level = all_agent_arm_levels[agent_idx, arm_idx]
+    accept = new_level > current_level
+    return jax.lax.cond(
+        accept,
+        lambda: (
+            all_agent_arm_levels[agent_idx].at[arm_idx].set(new_level),
+            all_agent_arm_payoff_estimates[agent_idx].at[arm_idx].set(new_payoff),
+            True,
+        ),
+        lambda: (
+            all_agent_arm_levels[agent_idx],
+            all_agent_arm_payoff_estimates[agent_idx],
+            False,
+        ),
+    )
+
+
+@partial(jax.jit, static_argnames=("n_arms",))
+def sample_arm_rewards(key, n_arms):
+    rewards = jax.random.exponential(key, shape=(n_arms,))
+    rewards = jnp.ceil(rewards**2)
+
+    full_rewards = jnp.zeros((n_arms, 1 + l_max))
+    return full_rewards.at[:, 1:].set(rewards[:, None] + increments[:l_max][None, :])
+
+
+@partial(jax.jit, static_argnames=("grid_length", "n_arms", "T"))
 def run_simulation_loop(
     key,
     grid_length,
+    n_arms,
     T,
     run_cgs=True,
     disconnect_group_traits=False,
@@ -60,16 +176,16 @@ def run_simulation_loop(
     cgs_mut_std=0.05,
     max_n_groups=9,
     tournament_size=3,
-    p_i=1.0,
-    p_c=1.0,
-    b=0.2,
-    innov_cost=0.2,
-    p_d=0.001,
-    init_q=1.0,
+    innov_cost=2.0,
+    p_death=0.001,
+    p_change=0.01,
     choice_beta=0.1,
-    learning_rate=0.1,
     imit_dist_threshold=1,
+    learning_rate=0.1,
+    init_q=1.0,
 ):
+    n_agents = grid_length**2
+
     # In the top-down regime, every group-selection event replaces all 9 groups
     # with fresh descendants, so we budget for one initial cohort plus at most T
     # subsequent cohorts.
@@ -77,8 +193,7 @@ def run_simulation_loop(
     EMPTY_GROUP_INSTANCE_ID = jnp.int32(-1)
 
     # Compute pairwise toroidal distances between agents for imitation.
-    N = grid_length**2
-    agent_idxs = jnp.arange(N)
+    agent_idxs = jnp.arange(n_agents)
     agent_locs = jnp.stack(
         [
             agent_idxs // grid_length,  # row index
@@ -203,24 +318,44 @@ def run_simulation_loop(
         return (group_labels_grid == group).reshape(-1) & neighbours_mask[agent_idx]
 
     @jax.jit
-    def update_traits(key, all_traits, all_roles, group_labels_grid, curr_Ls):
-        group_labels_1d = group_labels_grid.reshape(-1)
-
+    def update_arm_knowledge(
+        key,
+        all_agent_arm_levels,
+        all_agent_arm_payoff_estimates,
+        all_roles,
+        group_labels_grid,
+        full_rewards,
+    ):
         def per_agent(key_, agent_idx):
-            group_idx = group_labels_1d[agent_idx]
-
             def do_innovate(_):
-                new_traits, success = innovate(
-                    key_, all_traits[agent_idx], curr_Ls[group_idx], p_i
+                new_levels, new_payoffs, success = innovate(
+                    key_,
+                    all_agent_arm_levels[agent_idx],
+                    all_agent_arm_payoff_estimates[agent_idx],
+                    full_rewards,
                 )
-                return new_traits, success, 0  # traits, # innovated, # imitated
+                return (
+                    new_levels,
+                    new_payoffs,
+                    success.astype(int),
+                    0,
+                )  # levels, payoffs, # innovated, # imitated
 
             def do_imitate(_):
                 imit_mask = can_imitate(agent_idx, group_labels_grid)
-                new_traits, n_copied = imitate(
-                    key_, all_traits, imit_mask, agent_idx, p_c
+                new_levels, new_payoffs, success = imitate(
+                    key_,
+                    all_agent_arm_levels,
+                    all_agent_arm_payoff_estimates,
+                    imit_mask,
+                    agent_idx,
                 )
-                return new_traits, 0, n_copied  # traits, # innovated, # imitated
+                return (
+                    new_levels,
+                    new_payoffs,
+                    0,
+                    success.astype(int),
+                )  # levels, payoffs, # innovated, # imitated
 
             return jax.lax.cond(
                 all_roles[agent_idx] == ROLE_INNOVATE,
@@ -229,8 +364,11 @@ def run_simulation_loop(
                 operand=None,
             )
 
-        keys = jax.random.split(key, all_traits.shape[0])
-        return jax.vmap(per_agent)(keys, jnp.arange(all_traits.shape[0]))
+        keys = jax.random.split(key, all_agent_arm_levels.shape[0])
+        new_levels, new_payoffs, innovated, imitated = jax.vmap(per_agent)(
+            keys, jnp.arange(all_agent_arm_levels.shape[0])
+        )
+        return new_levels, new_payoffs, innovated.sum(), imitated.sum()
 
     @jax.jit
     def compute_role_costs_and_benefits(
@@ -255,87 +393,82 @@ def run_simulation_loop(
         innov_cost_only = jnp.where(all_roles == ROLE_INNOVATE, -innov_cost, 0.0)
         return jnp.where(disconnect_group_traits, innov_cost_only, benefits)
 
+    vmapped_exploit = jax.vmap(exploit, in_axes=(0, 0, None))
+
     def body_fn(carry, t):
         (
             key,
-            curr_Ls,
-            all_traits,
-            all_q_vals,
+            full_rewards,
+            agent_arm_levels,
+            agent_arm_payoff_estimates,
+            q_vals,
             group_norm_values,
             group_labels_grid,
             group_instance_ids_by_label,
             next_group_instance_id,
             group_parent_instance_ids,
             group_birth_timesteps,
-            traits_gained_since_cgs,
         ) = carry
 
         # get new keys
-        key, death_key, role_key, update_key, cgs_key = jax.random.split(key, 5)
+        key, change_key, death_key, role_key, update_key, cgs_key = jax.random.split(
+            key, 6
+        )
+
+        # maybe reset environment rewards
+        full_rewards = jax.lax.cond(
+            jax.random.bernoulli(change_key, p=p_change),
+            lambda: sample_arm_rewards(key, n_arms),
+            lambda: full_rewards,
+        )
 
         # random deaths
-        deaths = jax.random.bernoulli(death_key, p_d, shape=(N,))
-        all_traits = jnp.where(deaths[:, None], 0, all_traits)
-        all_q_vals = jnp.where(deaths[:, None], init_q, all_q_vals)
-        traits_gained_since_cgs = jnp.where(deaths, 0.0, traits_gained_since_cgs)
+        deaths = jax.random.bernoulli(death_key, p=p_death, shape=(n_agents,))
+        agent_arm_levels = jnp.where(deaths[:, None], 0, agent_arm_levels)
+        agent_arm_payoff_estimates = jnp.where(
+            deaths[:, None], 0.0, agent_arm_payoff_estimates
+        )
+
+        # compute payoffs from exploiting current knowledge
+        curr_payoffs, agent_arm_payoff_estimates = vmapped_exploit(
+            agent_arm_levels, agent_arm_payoff_estimates, full_rewards
+        )
 
         # agents select roles
-        role_probs = jax.nn.softmax(all_q_vals / choice_beta, axis=1)
-        all_roles = jax.random.categorical(role_key, jnp.log(role_probs), axis=1)
+        role_probs = jax.nn.softmax(q_vals / choice_beta, axis=1)
+        roles = jax.random.categorical(role_key, jnp.log(role_probs), axis=1)
 
-        # compute current payoffs
-        curr_trait_payoffs = compute_trait_payoffs(all_traits, b)
-
-        # update traits and compute new payoffs
-        new_all_traits, n_innovated, n_imitated = update_traits(
-            update_key, all_traits, all_roles, group_labels_grid, curr_Ls
+        # update knowledge based on roles and compute new prospective payoffs
+        new_agent_arm_levels, new_agent_arm_payoff_estimates, n_innov, n_imit = (
+            update_arm_knowledge(
+                update_key,
+                agent_arm_levels,
+                agent_arm_payoff_estimates,
+                roles,
+                group_labels_grid,
+                full_rewards,
+            )
         )
-        new_trait_payoffs = compute_trait_payoffs(new_all_traits, b)
-        updated_traits_gained_since_cgs = traits_gained_since_cgs + (
-            n_innovated + n_imitated
-        ).astype(jnp.float32)
+        new_payoffs, _ = vmapped_exploit(
+            new_agent_arm_levels, new_agent_arm_payoff_estimates, full_rewards
+        )
 
         # compute role rewards and costs
-        rewards = new_trait_payoffs - curr_trait_payoffs
+        rewards = new_payoffs - curr_payoffs
         rewards += compute_role_costs_and_benefits(
-            all_roles, innov_cost, group_labels_grid, group_norm_values
+            roles, innov_cost, group_labels_grid, group_norm_values
         )
 
-        # update q vals
-        rpe = rewards - all_q_vals[jnp.arange(N), all_roles]
-        new_all_q_vals = all_q_vals.at[jnp.arange(N), all_roles].add(
-            learning_rate * rpe
-        )
-
-        # compute some metrics for logging
-        total_unique_traits_known = (all_traits.sum(axis=0) > 0).sum()
-        per_agent_traits_known = all_traits.sum(axis=1)
-        most_traits_known, mean_traits_known = (
-            per_agent_traits_known.max(),
-            per_agent_traits_known.mean(),
-        )
-
-        # determine whether to unlock new space of traits
-        # mask = jnp.arange(MAX_TOTAL_L)
-        # mask = (mask >= curr_L - L) & (mask < curr_L)
-        # mean_prop_known = (all_traits * mask.reshape(1, -1)).sum(axis=1).mean() / L
-
-        group_num_traits_known = _group_average_values(
-            group_labels_grid, per_agent_traits_known
-        )
-        group_new_traits_gained = _group_average_values(
-            group_labels_grid, updated_traits_gained_since_cgs
-        )
-        group_trait_gain_scores = group_new_traits_gained / curr_Ls.astype(jnp.float32)
-        group_prop_traits_known = group_num_traits_known / curr_Ls
-        unlock = (group_prop_traits_known >= 0.9) & (curr_Ls < MAX_TOTAL_L)
-        new_Ls = jnp.where(unlock, curr_Ls + L, curr_Ls)
+        # update q-values
+        rpe = rewards - q_vals[jnp.arange(n_agents), roles]
+        new_all_q_vals = q_vals.at[jnp.arange(n_agents), roles].add(learning_rate * rpe)
 
         # Every `run_cgs_every` steps, do tournament selection and mutation at the group level
         should_run_group_selection = run_cgs & (t % run_cgs_every == 0) & (t > 0)
         old_group_labels_grid = group_labels_grid
         old_group_norm_values = group_norm_values
         old_group_instance_ids_by_label = group_instance_ids_by_label
+        group_scores = _group_average_values(group_labels_grid, curr_payoffs)
         (
             group_labels_grid,
             group_norm_values,
@@ -354,7 +487,7 @@ def run_simulation_loop(
                 t,
                 group_labels_grid,
                 group_norm_values,
-                group_trait_gain_scores,
+                group_scores,
                 group_instance_ids_by_label,
                 next_group_instance_id,
                 group_parent_instance_ids,
@@ -370,16 +503,17 @@ def run_simulation_loop(
             group_norm_values,
             group_instance_ids_by_label,
         )
-        next_traits_gained_since_cgs = jnp.where(
-            should_run_group_selection,
-            jnp.zeros_like(updated_traits_gained_since_cgs),
-            updated_traits_gained_since_cgs,
-        )
+
+        # compute some metrics for logging
+        mean_payoff = curr_payoffs.mean()
+        mean_avg_level = agent_arm_levels.mean()
+        mean_max_level = agent_arm_levels.max(axis=1).mean()
 
         return (
             key,
-            new_Ls,
-            new_all_traits,
+            full_rewards,
+            new_agent_arm_levels,
+            new_agent_arm_payoff_estimates,
             new_all_q_vals,
             group_norm_values,
             group_labels_grid,
@@ -387,13 +521,16 @@ def run_simulation_loop(
             next_group_instance_id,
             group_parent_instance_ids,
             group_birth_timesteps,
-            next_traits_gained_since_cgs,
         ), (
-            mean_traits_known,
+            mean_payoff,
+            mean_avg_level,
+            mean_max_level,
             group_norm_values,
             group_labels_grid,
             group_instance_ids_by_label,
         )
+
+    full_rewards = sample_arm_rewards(key, n_arms)
 
     init_norm_key = jax.random.fold_in(key, 0)
     group_norm_values = (
@@ -412,38 +549,47 @@ def run_simulation_loop(
     )
 
     carry = (
-        key,  # key
-        jnp.full(max_n_groups, L, dtype=jnp.int32),  # curr_Ls
-        jnp.zeros((N, MAX_TOTAL_L), dtype=jnp.int8),  # all_traits
-        jnp.full((N, 2), init_q, dtype=jnp.float32),  # all_q_vals
+        key,
+        full_rewards,
+        jnp.zeros((n_agents, n_arms), dtype=jnp.int32),  # agent_arm_levels
+        jnp.zeros((n_agents, n_arms), dtype=jnp.float32),  # agent_arm_payoff_estimates
+        jnp.full((n_agents, 2), init_q, dtype=jnp.float32),  # q_vals
         group_norm_values,
         base_group_grid,
         group_instance_ids_by_label,
         next_group_instance_id,
         group_parent_instance_ids,
         group_birth_timesteps,
-        jnp.zeros(N, dtype=jnp.float32),  # traits_gained_since_cgs
     )
 
     carry, metrics = jax.lax.scan(body_fn, carry, jnp.arange(T))
+    return (
+        metrics[0] / full_rewards.max(),
+        *metrics[1:],
+        carry[8],
+        carry[9],
+        carry[10],
+    )
 
-    return (*metrics, carry[7], carry[8], carry[9])
 
+seeds = [0, 1, 2]
+grid_length, n_arms, T = 30, 200, int(2e3)
 
-seeds = list(range(5))
-grid_length, T = 30, int(2.5e3)
-
-all_mean_traits_known = []
+all_prop_payoffs = []
+all_mean_avg_levels = []
+all_mean_max_levels = []
 all_group_norm_values = []
 all_group_labels_grids = []
 all_group_instance_ids_by_label_history = []
 all_group_lineage_arrays = []
 all_final_next_group_instance_ids = []
+
 for seed in tqdm(seeds):
     key = jax.random.PRNGKey(seed)
-
     (
-        mean_traits_known,
+        prop_payoffs,
+        mean_avg_levels,
+        mean_max_levels,
         group_norm_values,
         group_labels_grid,
         group_instance_ids_by_label_history,
@@ -454,13 +600,16 @@ for seed in tqdm(seeds):
         run_simulation_loop(
             key,
             grid_length,
+            n_arms,
             T,
             run_cgs=True,
             disconnect_group_traits=False,
         )
     )
 
-    all_mean_traits_known.append(np.asarray(mean_traits_known))
+    all_prop_payoffs.append(np.asarray(prop_payoffs))
+    all_mean_avg_levels.append(np.asarray(mean_avg_levels))
+    all_mean_max_levels.append(np.asarray(mean_max_levels))
     all_group_norm_values.append(np.asarray(group_norm_values))
     all_group_labels_grids.append(np.asarray(group_labels_grid))
     all_group_instance_ids_by_label_history.append(
@@ -483,7 +632,9 @@ simulation_outputs = {
     "grid_length": np.int32(grid_length),
     "role_innovate": np.int32(ROLE_INNOVATE),
     "role_imitate": np.int32(ROLE_IMITATE),
-    "mean_traits_known": np.stack(all_mean_traits_known, axis=0),
+    "payoffs": np.stack(all_prop_payoffs, axis=0),
+    "avg_levels": np.stack(all_mean_avg_levels, axis=0),
+    "max_levels": np.stack(all_mean_max_levels, axis=0),
     "group_norm_values": np.stack(all_group_norm_values, axis=0),
     "group_labels_grids": np.stack(all_group_labels_grids, axis=0),
     "group_instance_ids_by_label_history": np.stack(
