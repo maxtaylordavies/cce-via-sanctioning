@@ -18,14 +18,14 @@ sampling_interval = 10
 scalar_keys = {
     "T",
     "grid_length",
+    "max_total_l",
+    "prestige_decay",
+    "prestige_baseline",
+    "pool_share",
     "role_innovate",
     "role_imitate",
 }
-
-for filename in sorted(os.listdir(DATA_DIR)):
-    if not filename.endswith(".npz"):
-        continue
-    file_outputs = np.load(DATA_DIR / filename, allow_pickle=True)
+parameter_keys = {"prestige_gains", "fees"}
 
 outputs = {}
 concat_buffers = {}
@@ -43,11 +43,11 @@ for filename in sorted(os.listdir(DATA_DIR)):
                 raise ValueError(f"Inconsistent scalar value for {key!r} in {filename}")
             continue
 
-        if key == "fees":
+        if key in parameter_keys:
             if key not in outputs:
                 outputs[key] = value
             elif not np.array_equal(outputs[key], value):
-                raise ValueError(f"Inconsistent fee grid in {filename}")
+                raise ValueError(f"Inconsistent parameter grid for {key!r} in {filename}")
             continue
 
         if key not in concat_buffers:
@@ -58,11 +58,20 @@ for key, values in concat_buffers.items():
     outputs[key] = np.concatenate(values, axis=0)
 
 
+def get_parameter_values(raw_outputs):
+    if "prestige_gains" in raw_outputs:
+        return "prestige_gain", np.asarray(raw_outputs["prestige_gains"], dtype=np.float64)
+    return "fee", np.asarray(raw_outputs["fees"], dtype=np.float64)
+
+
+parameter_name, parameter_values = get_parameter_values(outputs)
+
+
 def plot_preliminary_innovation_decay(raw_outputs):
-    fees = np.asarray(raw_outputs["fees"], dtype=np.float64)
-    fee_zero_idx = int(np.argmin(np.abs(fees - 0.0)))
+    _, values = get_parameter_values(raw_outputs)
+    zero_idx = int(np.argmin(np.abs(values - 0.0)))
     role_innovate = int(raw_outputs["role_innovate"])
-    innov_prob_ts = raw_outputs["role_probs"][:, fee_zero_idx, :, role_innovate]
+    innov_prob_ts = raw_outputs["role_probs"][:, zero_idx, :, role_innovate]
 
     t = np.arange(innov_prob_ts.shape[1])
     window = 5
@@ -95,44 +104,48 @@ def plot_preliminary_innovation_decay(raw_outputs):
         ylim=(0, 0.65),
     )
     sns.despine(ax=ax, left=True, bottom=True)
-    save_fig(
-        fig,
-        "preliminary_innovation_decay_fee_0",
-        subfolder=f"{env_name}/experiment_{exp_num}",
-    )
+    plt.show()
+    # save_fig(
+    #     fig,
+    #     "preliminary_innovation_decay_prestige_gain_0",
+    #     subfolder=f"{env_name}/experiment_{exp_num}",
+    # )
 
 
 rows = []
 for seed_idx, seed in enumerate(outputs["seeds"]):
-    for fee_idx, fee in enumerate(outputs["fees"]):
+    for parameter_idx, parameter_value in enumerate(parameter_values):
         for t in range(outputs["T"]):
             if t % sampling_interval != 0:
                 continue
             rows.append(
                 {
                     "seed": seed,
-                    "fee": fee,
+                    parameter_name: parameter_value,
                     "t": t,
-                    "mean_traits": outputs["mean_traits"][seed_idx, fee_idx, t],
+                    "mean_traits": outputs["mean_traits"][seed_idx, parameter_idx, t],
                     "p_innovate": outputs["role_probs"][
-                        seed_idx, fee_idx, t, outputs["role_innovate"]
+                        seed_idx, parameter_idx, t, outputs["role_innovate"]
                     ],
-                    "n_innovated": outputs["n_innovated"][seed_idx, fee_idx, t],
-                    "n_imitated": outputs["n_imitated"][seed_idx, fee_idx, t],
+                    "n_innovated": outputs["n_innovated"][seed_idx, parameter_idx, t],
+                    "n_imitated": outputs["n_imitated"][seed_idx, parameter_idx, t],
                 }
             )
 
 df = pd.DataFrame(rows)
 
-df["mean_traits"] = df["mean_traits"] / 1e4
-for col in ["fee", "n_innovated", "n_imitated"]:
-    df[col] = df[col] / df[col].max()
+df = df[df[parameter_name] >= 0.0]
 
-x_lims = (-1.05, 1.05)
-lower_goldilocks, upper_goldilocks = 0.1, 0.5
+max_total_l = float(outputs.get("max_total_l", 5000))
+df["mean_traits"] = df["mean_traits"] / max_total_l
+for col in ["n_innovated", "n_imitated"]:
+    if df[col].max() > 0:
+        df[col] = df[col] / df[col].max()
+
+x_lims = (df[parameter_name].min(), df[parameter_name].max())
 
 final_df = df[df["t"] == df["t"].max()]
-fig, axs = plt.subplots(1, 3, figsize=(12, 3.5), sharey=True)
+fig, axs = plt.subplots(1, 3, figsize=(12, 3.5))
 titles = [
     "Mean cultural score (proportion of max possible)",
     "# successful innovation events (normalised)",
@@ -141,55 +154,22 @@ titles = [
 for i, metric in enumerate(["mean_traits", "n_innovated", "n_imitated"]):
     sns.lineplot(
         data=final_df,
-        x="fee",
+        x=parameter_name,
         y=metric,
         ax=axs[i],
         marker="o",
         color="black",
         err_style="bars",
     )
-    axs[i].axvspan(x_lims[0], lower_goldilocks, color="#f4c7c3", alpha=0.3, zorder=0)
-    axs[i].axvspan(
-        lower_goldilocks, upper_goldilocks, color="#d8f0c8", alpha=0.3, zorder=0
+    axs[i].set(
+        xlabel="prestige gain" if parameter_name == "prestige_gain" else "$c$",
+        xlim=x_lims,
+        ylabel=None,
+        title=titles[i],
     )
-    axs[i].axvspan(upper_goldilocks, x_lims[1], color="#f4c7c3", alpha=0.3, zorder=0)
-    axs[i].set(xlabel="$c$ (normalised)", xlim=x_lims, ylabel=None, title=titles[i])
     sns.despine(ax=axs[i], left=True, bottom=True)
 
-trans = axs[0].get_xaxis_transform()
-axs[0].text(
-    x_lims[0] + 0.03,
-    0.98,
-    "too little\ninnovation\nand transmission",
-    transform=trans,
-    ha="left",
-    va="top",
-    fontsize=9,
-    fontweight="bold",
-    color="#831e17",
-)
-axs[0].text(
-    lower_goldilocks + 0.2,
-    0.98,
-    '"goldilocks\nzone"',
-    transform=trans,
-    ha="center",
-    va="top",
-    fontsize=9,
-    fontweight="bold",
-    color="#0e4812",
-)
-axs[0].text(
-    x_lims[1] - 0.03,
-    0.98,
-    "too little\ntransmission",
-    transform=trans,
-    ha="right",
-    va="top",
-    fontsize=9,
-    fontweight="bold",
-    color="#831e17",
-)
+plt.show()
 
-save_fig(fig, "final_metrics_by_fee", subfolder=f"{env_name}/experiment_{exp_num}")
+# save_fig(fig, "final_metrics_by_prestige_gain", subfolder=f"{env_name}/experiment_{exp_num}")
 plot_preliminary_innovation_decay(outputs)
