@@ -267,12 +267,14 @@ def plot_group_lineage(
     return fig, ax
 
 
-def plot_average_norm_values_over_time(ts, real_norm_values, neutral_norm_values):
-    print(real_norm_values)
-    print(neutral_norm_values)
-
+def plot_average_norm_values_over_time(
+    ts, real_norm_values, neutral_norm_values, ax=None
+):
     # Save one line per seed on a shared set of axes.
-    fig, ax = plt.subplots(figsize=(6, 4))
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(6, 4))
+    else:
+        fig = ax.figure
 
     max_n_seeds = max(real_norm_values.shape[0], neutral_norm_values.shape[0])
     for seed_idx in range(max_n_seeds):
@@ -301,23 +303,26 @@ def plot_average_norm_values_over_time(ts, real_norm_values, neutral_norm_values
         )
 
     ax.set(
-        xlabel="t",
-        ylabel="$c$",
-        title="Population-average $c$ over time",
+        xlabel="t", ylabel="$c$", title="Mean evolved $c$ over time", ylim=(-0.35, 0.55)
     )
-    ax.axhline(0, color="red", linestyle="--", linewidth=2.5)
+    ax.axhline(0, color="red", linestyle="--", linewidth=2, alpha=0.7)
 
     # remove legend
-    ax.legend().remove()
+    legend = ax.get_legend()
+    if legend is not None:
+        legend.remove()
 
     sns.despine(ax=ax, left=True, bottom=True)
 
     return fig, ax
 
 
-def plot_mean_traits_known(ts, real_vals, neutral_vals):
+def plot_mean_traits_known(ts, real_vals, neutral_vals, ax=None):
     # Save one line per seed on a shared set of axes.
-    fig, ax = plt.subplots(figsize=(6, 4))
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(6, 4))
+    else:
+        fig = ax.figure
 
     max_n_seeds = max(real_vals.shape[0], neutral_vals.shape[0])
     for seed_idx in range(max_n_seeds):
@@ -344,15 +349,32 @@ def plot_mean_traits_known(ts, real_vals, neutral_vals):
 
     ax.set(
         xlabel="t",
-        ylabel="mean traits known",
-        title="Population-average # traits known over time",
+        ylabel="score",
+        title="Mean cultural score over time (proportion of max possible)",
+        ylim=(-0.05, 1.05),
     )
 
     # remove legend
-    ax.legend().remove()
+    legend = ax.get_legend()
+    if legend is not None:
+        legend.remove()
     sns.despine(ax=ax, left=True, bottom=True)
 
     return fig, ax
+
+
+def plot_yield_and_norm_values_over_time(
+    ts, real_yields, neutral_yields, real_norm_values, neutral_norm_values
+):
+    fig, axs = plt.subplots(2, 1, figsize=(6, 8), sharex=True)
+
+    plot_average_norm_values_over_time(
+        ts, real_norm_values, neutral_norm_values, ax=axs[0]
+    )
+    plot_mean_traits_known(ts, real_yields, neutral_yields, ax=axs[1])
+
+    axs[0].set(xlabel=None)
+    return fig, axs
 
 
 def plot_norms_vs_traits_known(
@@ -419,7 +441,7 @@ for seed_idx in range(max_n_seeds):
                 )
             )
             processed_data[run_type]["population_average_traits_known"].append(
-                raw_data[run_type]["sampled_mean_traits_known"][seed_idx]
+                raw_data[run_type]["sampled_mean_traits_known"][seed_idx] / 1e4
             )
             if run_type == "real" and seed_idx in lineage_seeds:
                 full_instance_norm_series = build_group_instance_norm_series(
@@ -470,19 +492,14 @@ for run_type in ["real", "neutral"]:
         ].mean(axis=1)
     )
 
-fig, ax = plot_average_norm_values_over_time(
-    sampled_timesteps,
-    processed_data_np["real"]["average_norm_values"],
-    processed_data_np["neutral"]["average_norm_values"],
-)
-save_figure(fig, "average_group_norm_values")
-
-fig, ax = plot_mean_traits_known(
+fig, axs = plot_yield_and_norm_values_over_time(
     sampled_timesteps,
     processed_data_np["real"]["population_average_traits_known"],
     processed_data_np["neutral"]["population_average_traits_known"],
+    processed_data_np["real"]["average_norm_values"],
+    processed_data_np["neutral"]["average_norm_values"],
 )
-save_figure(fig, "population_average_traits_known")
+save_figure(fig, "yield_and_average_group_norm_values")
 
 fig, axs = plot_norms_vs_traits_known(
     processed_data_np["real"]["average_norm_values"],

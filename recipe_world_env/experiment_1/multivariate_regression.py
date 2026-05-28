@@ -9,7 +9,7 @@ import statsmodels.api as sm
 from statsmodels.stats.anova import anova_lm
 from statsmodels.stats.outliers_influence import variance_inflation_factor
 
-from experiment_1.make_all_plots import (
+from recipe_world_env.experiment_1.make_all_plots import (
     build_recipe_plot_data,
     build_specialisation_plot_data,
     get_fee_plotting_config,

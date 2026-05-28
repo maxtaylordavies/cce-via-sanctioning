@@ -18,7 +18,7 @@ LINEAGES_DIR = OUTPUT_DIR / "lineages"
 LINEAGES_DIR.mkdir(parents=True, exist_ok=True)
 
 T = int(1e4)
-CGS_INTERVAL = 10
+CGS_INTERVAL = 20
 COLORS = ["xkcd:turquoise", "xkcd:periwinkle"]
 
 
@@ -72,7 +72,7 @@ for run_type in raw_data.keys():
     raw_data[run_type]["final_next_group_instance_ids"] = outputs[
         "final_next_group_instance_ids"
     ]
-    raw_data[run_type]["agent_yields"] = outputs["agent_yields"]
+    raw_data[run_type]["agent_yields"] = outputs["agent_yields"] / 15.0
 
 max_n_seeds = max(
     raw_data["real"]["group_norm_values"].shape[0],
@@ -267,9 +267,14 @@ def plot_group_lineage(
     return fig, ax
 
 
-def plot_average_norm_values_over_time(ts, real_norm_values, neutral_norm_values):
+def plot_average_norm_values_over_time(
+    ts, real_norm_values, neutral_norm_values, ax=None
+):
     # Save one line per seed on a shared set of axes.
-    fig, ax = plt.subplots(figsize=(6, 4))
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(6, 4))
+    else:
+        fig = ax.figure
 
     max_n_seeds = max(real_norm_values.shape[0], neutral_norm_values.shape[0])
     for seed_idx in range(max_n_seeds):
@@ -298,23 +303,26 @@ def plot_average_norm_values_over_time(ts, real_norm_values, neutral_norm_values
         )
 
     ax.set(
-        xlabel="t",
-        ylabel="$c$",
-        title="Population-average $c$ over time",
+        xlabel="t", ylabel="$c$", title="Mean evolved $c$ over time", ylim=(-0.35, 0.55)
     )
     ax.axhline(0, color="red", linestyle="--", linewidth=2.5)
 
     # remove legend
-    ax.legend().remove()
+    legend = ax.get_legend()
+    if legend is not None:
+        legend.remove()
 
     sns.despine(ax=ax, left=True, bottom=True)
 
     return fig, ax
 
 
-def plot_yields(ts, real_yields, neutral_yields):
+def plot_yields(ts, real_yields, neutral_yields, ax=None):
     # Save one line per seed on a shared set of axes.
-    fig, ax = plt.subplots(figsize=(6, 4))
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(6, 4))
+    else:
+        fig = ax.figure
 
     max_n_seeds = max(real_yields.shape[0], neutral_yields.shape[0])
     for seed_idx in range(max_n_seeds):
@@ -341,15 +349,33 @@ def plot_yields(ts, real_yields, neutral_yields):
 
     ax.set(
         xlabel="t",
-        ylabel="yield",
-        title="Population-average yield over time",
+        ylabel="score",
+        title="Mean cultural score over time (proportion of max possible)",
+        ylim=(-0.05, 1.05),
     )
 
     # remove legend
-    ax.legend().remove()
+    legend = ax.get_legend()
+    if legend is not None:
+        legend.remove()
     sns.despine(ax=ax, left=True, bottom=True)
 
     return fig, ax
+
+
+def plot_yields_and_norm_values_over_time(
+    ts, real_yields, neutral_yields, real_norm_values, neutral_norm_values
+):
+    fig, axs = plt.subplots(2, 1, figsize=(6, 8), sharex=True)
+
+    plot_average_norm_values_over_time(
+        ts, real_norm_values, neutral_norm_values, ax=axs[0]
+    )
+    plot_yields(ts, real_yields, neutral_yields, ax=axs[1])
+
+    axs[0].set(xlabel=None)
+
+    return fig, axs
 
 
 def plot_norms_vs_yields(real_norms, real_yields, neutral_norms, neutral_yields):
@@ -472,19 +498,14 @@ for key in [
 ]:
     processed_data_np["real"][key] = processed_data_np["real"][key][kept_seed_mask]
 
-fig, ax = plot_average_norm_values_over_time(
-    sampled_timesteps,
-    processed_data_np["real"]["average_norm_values"],
-    processed_data_np["neutral"]["average_norm_values"],
-)
-save_figure(fig, "average_group_norm_values")
-
-fig, ax = plot_yields(
+fig, axs = plot_yields_and_norm_values_over_time(
     sampled_timesteps,
     processed_data_np["real"]["population_average_yields"],
     processed_data_np["neutral"]["population_average_yields"],
+    processed_data_np["real"]["average_norm_values"],
+    processed_data_np["neutral"]["average_norm_values"],
 )
-save_figure(fig, "population_average_yields")
+save_figure(fig, "yield_and_average_group_norm_values")
 
 fig, axs = plot_norms_vs_yields(
     processed_data_np["real"]["average_norm_values"],

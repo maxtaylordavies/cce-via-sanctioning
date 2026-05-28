@@ -1,5 +1,6 @@
 import os
 import numpy as np
+import matplotlib.pyplot as plt
 
 
 def weighted_mean(values, weights):
@@ -9,7 +10,7 @@ def weighted_mean(values, weights):
     return float(np.average(values, weights=weights))
 
 
-def save_fig(fig, filename, subfolder=None, fmts=["svg", "png"], tight=True):
+def save_fig(fig, name, subfolder=None, fmts=["svg", "png"], tight=True):
     folder = "figures"
     if subfolder is not None:
         folder = f"{folder}/{subfolder}"
@@ -21,4 +22,6 @@ def save_fig(fig, filename, subfolder=None, fmts=["svg", "png"], tight=True):
         fig.tight_layout()
 
     for fmt in fmts:
-        fig.savefig(f"{folder}/{filename}.{fmt}", bbox_inches="tight")
+        fig.savefig(f"{folder}/{name}.{fmt}", bbox_inches="tight", dpi=300)
+
+    plt.close(fig)

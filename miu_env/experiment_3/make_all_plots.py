@@ -272,12 +272,14 @@ def plot_group_lineage(
     return fig, ax
 
 
-def plot_average_norm_values_over_time(ts, real_norm_values, neutral_norm_values):
-    print(real_norm_values)
-    print(neutral_norm_values)
-
+def plot_average_norm_values_over_time(
+    ts, real_norm_values, neutral_norm_values, ax=None
+):
     # Save one line per seed on a shared set of axes.
-    fig, ax = plt.subplots(figsize=(6, 4))
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(6, 4))
+    else:
+        fig = ax.figure
 
     max_n_seeds = max(real_norm_values.shape[0], neutral_norm_values.shape[0])
     for seed_idx in range(max_n_seeds):
@@ -306,90 +308,85 @@ def plot_average_norm_values_over_time(ts, real_norm_values, neutral_norm_values
         )
 
     ax.set(
-        xlabel="t",
-        ylabel="$c$",
-        title="Population-average $c$ over time",
+        xlabel="t", ylabel="$c$", title="Mean evolved $c$ over time", ylim=(-0.25, 0.35)
     )
-    ax.axhline(0, color="red", linestyle="--", linewidth=2.5)
+    ax.axhline(0, color="red", linestyle="--", linewidth=2.0, alpha=0.7)
 
     # remove legend
-    ax.legend().remove()
+    legend = ax.get_legend()
+    if legend is not None:
+        legend.remove()
 
     sns.despine(ax=ax, left=True, bottom=True)
 
     return fig, ax
 
 
-def plot_mean_payoff_and_max_level(
-    ts,
-    real_payoffs,
-    neutral_payoffs,
-    real_max_levels,
-    neutral_max_levels,
-):
+def plot_mean_payoff(ts, real_payoffs, neutral_payoffs, ax=None):
     # Save one line per seed on a shared set of axes.
-    fig, axs = plt.subplots(1, 2, figsize=(10, 4))
-    panels = [
-        (
-            axs[0],
-            real_payoffs,
-            neutral_payoffs,
-            "payoff (fraction of max possible)",
-            "Population-average payoff over time",
-        ),
-        (
-            axs[1],
-            real_max_levels,
-            neutral_max_levels,
-            "max level",
-            "Population-average max level over time",
-        ),
-    ]
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(6, 4))
+    else:
+        fig = ax.figure
 
-    for ax, real_vals, neutral_vals, ylabel, title in panels:
-        max_n_seeds = max(real_vals.shape[0], neutral_vals.shape[0])
-        for seed_idx in range(max_n_seeds):
-            for vals, color in zip([real_vals, neutral_vals], COLORS):
-                if seed_idx < vals.shape[0]:
-                    sns.lineplot(
-                        x=ts,
-                        y=vals[seed_idx],
-                        ax=ax,
-                        color=color,
-                        alpha=0.5,
-                    )
+    max_n_seeds = max(real_payoffs.shape[0], neutral_payoffs.shape[0])
+    for seed_idx in range(max_n_seeds):
+        for vals, color in zip([real_payoffs, neutral_payoffs], COLORS):
+            if seed_idx < vals.shape[0]:
+                sns.lineplot(
+                    x=ts,
+                    y=vals[seed_idx],
+                    ax=ax,
+                    color=color,
+                    alpha=0.5,
+                )
 
-        means = [np.nanmean(real_vals, axis=0), np.nanmean(neutral_vals, axis=0)]
-        for mean_val, color in zip(means, COLORS):
-            sns.lineplot(
-                x=ts,
-                y=mean_val,
-                ax=ax,
-                color=color,
-                linewidth=4,
-                zorder=10,
-            )
-
-        ax.set(
-            xlabel="t",
-            ylabel=ylabel,
-            title=title,
+    means = [np.nanmean(real_payoffs, axis=0), np.nanmean(neutral_payoffs, axis=0)]
+    for mean_val, color in zip(means, COLORS):
+        sns.lineplot(
+            x=ts,
+            y=mean_val,
+            ax=ax,
+            color=color,
+            linewidth=4,
+            zorder=10,
         )
 
-        # remove legend
-        ax.legend().remove()
-        sns.despine(ax=ax, left=True, bottom=True)
+    ax.set(
+        xlabel="t",
+        ylabel="score",
+        title="Mean cultural score over time (proportion of max possible)",
+        ylim=(-0.05, 1.05),
+    )
+
+    # remove legend
+    legend = ax.get_legend()
+    if legend is not None:
+        legend.remove()
+    sns.despine(ax=ax, left=True, bottom=True)
+
+    return fig, ax
+
+
+def plot_payoff_and_norm_values_over_time(
+    ts, real_payoffs, neutral_payoffs, real_norm_values, neutral_norm_values
+):
+    fig, axs = plt.subplots(2, 1, figsize=(6, 8), sharex=True)
+
+    plot_average_norm_values_over_time(
+        ts, real_norm_values, neutral_norm_values, ax=axs[0]
+    )
+    plot_mean_payoff(ts, real_payoffs, neutral_payoffs, ax=axs[1])
+    axs[0].set(xlabel=None)
 
     return fig, axs
 
 
-def plot_norms_vs_payoff_and_max_level(
+def plot_norms_vs_payoff(
     real_norms,
     real_payoffs,
-    real_max_levels,
     neutral_norms,
     neutral_payoffs,
-    neutral_max_levels,
 ):
     real_norms_final = real_norms[:, -max(1, real_norms.shape[1] // 10) :].mean(axis=1)
     real_norms_avg = real_norms.mean(axis=1)
@@ -398,69 +395,35 @@ def plot_norms_vs_payoff_and_max_level(
     ].mean(axis=1)
     neutral_norms_avg = neutral_norms.mean(axis=1)
 
-    fig, axs = plt.subplots(2, 2, figsize=(9, 7))
+    fig, axs = plt.subplots(1, 2, figsize=(8, 4), sharey=True)
 
     sns.scatterplot(
-        x=real_norms_final, y=real_payoffs, ax=axs[0, 0], color=COLORS[0], s=100
+        x=real_norms_final, y=real_payoffs, ax=axs[0], color=COLORS[0], s=100
     )
     sns.scatterplot(
         x=neutral_norms_final,
         y=neutral_payoffs,
-        ax=axs[0, 0],
+        ax=axs[0],
         color=COLORS[1],
         s=100,
     )
-    axs[0, 0].set(
+    axs[0].set(
         xlabel="$c$",
         ylabel="payoff (fraction of max possible)",
         title="Population-average $c$ (final 10% of timesteps)\nvs final population-average payoff",
     )
 
+    sns.scatterplot(x=real_norms_avg, y=real_payoffs, ax=axs[1], color=COLORS[0], s=100)
     sns.scatterplot(
-        x=real_norms_avg, y=real_payoffs, ax=axs[0, 1], color=COLORS[0], s=100
+        x=neutral_norms_avg, y=neutral_payoffs, ax=axs[1], color=COLORS[1], s=100
     )
-    sns.scatterplot(
-        x=neutral_norms_avg, y=neutral_payoffs, ax=axs[0, 1], color=COLORS[1], s=100
-    )
-    axs[0, 1].set(
+    axs[1].set(
         xlabel="$c$",
         ylabel="payoff (fraction of max possible)",
         title="Population-average $c$ (all timesteps)\nvs final population-average payoff",
     )
 
-    sns.scatterplot(
-        x=real_norms_final, y=real_max_levels, ax=axs[1, 0], color=COLORS[0], s=100
-    )
-    sns.scatterplot(
-        x=neutral_norms_final,
-        y=neutral_max_levels,
-        ax=axs[1, 0],
-        color=COLORS[1],
-        s=100,
-    )
-    axs[1, 0].set(
-        xlabel="$c$",
-        ylabel="max level",
-        title="Population-average $c$ (final 10% of timesteps)\nvs final population-average max level",
-    )
-
-    sns.scatterplot(
-        x=real_norms_avg, y=real_max_levels, ax=axs[1, 1], color=COLORS[0], s=100
-    )
-    sns.scatterplot(
-        x=neutral_norms_avg,
-        y=neutral_max_levels,
-        ax=axs[1, 1],
-        color=COLORS[1],
-        s=100,
-    )
-    axs[1, 1].set(
-        xlabel="$c$",
-        ylabel="max level",
-        title="Population-average $c$ (all timesteps)\nvs final population-average max level",
-    )
-
-    for ax in axs.ravel():
+    for ax in axs:
         sns.despine(ax=ax, left=True, bottom=True)
     fig.tight_layout()
 
@@ -542,33 +505,21 @@ for run_type in ["real", "neutral"]:
     processed_data_np[run_type]["final_window_average_payoff"] = processed_data_np[
         run_type
     ]["population_average_payoff"][:, -final_window_len:].mean(axis=1)
-    processed_data_np[run_type]["final_window_average_max_level"] = processed_data_np[
-        run_type
-    ]["population_average_max_level"][:, -final_window_len:].mean(axis=1)
 
-fig, ax = plot_average_norm_values_over_time(
-    sampled_timesteps,
-    processed_data_np["real"]["average_norm_values"],
-    processed_data_np["neutral"]["average_norm_values"],
-)
-save_figure(fig, "average_group_norm_values")
-
-fig, ax = plot_mean_payoff_and_max_level(
+fig, axs = plot_payoff_and_norm_values_over_time(
     sampled_timesteps,
     processed_data_np["real"]["population_average_payoff"],
     processed_data_np["neutral"]["population_average_payoff"],
-    processed_data_np["real"]["population_average_max_level"],
-    processed_data_np["neutral"]["population_average_max_level"],
+    processed_data_np["real"]["average_norm_values"],
+    processed_data_np["neutral"]["average_norm_values"],
 )
-save_figure(fig, "population_average_payoff")
+save_figure(fig, "payoff_and_average_group_norm_values")
 
-fig, axs = plot_norms_vs_payoff_and_max_level(
+fig, axs = plot_norms_vs_payoff(
     processed_data_np["real"]["average_norm_values"],
     processed_data_np["real"]["final_window_average_payoff"],
-    processed_data_np["real"]["final_window_average_max_level"],
     processed_data_np["neutral"]["average_norm_values"],
     processed_data_np["neutral"]["final_window_average_payoff"],
-    processed_data_np["neutral"]["final_window_average_max_level"],
 )
 save_figure(fig, "norms_vs_payoff")
 
