@@ -21,6 +21,7 @@ scalar_keys = {
     "max_total_l",
     "prestige_decay",
     "prestige_baseline",
+    "prestige_value",
     "pool_share",
     "role_innovate",
     "role_imitate",
@@ -36,10 +37,10 @@ for filename in sorted(os.listdir(DATA_DIR)):
     for key in file_outputs.files:
         value = file_outputs[key]
 
-        if key in scalar_keys:
+        if key in scalar_keys or value.shape == ():
             if key not in outputs:
                 outputs[key] = value
-            elif outputs[key] != value:
+            elif not np.array_equal(outputs[key], value):
                 raise ValueError(f"Inconsistent scalar value for {key!r} in {filename}")
             continue
 
@@ -47,7 +48,9 @@ for filename in sorted(os.listdir(DATA_DIR)):
             if key not in outputs:
                 outputs[key] = value
             elif not np.array_equal(outputs[key], value):
-                raise ValueError(f"Inconsistent parameter grid for {key!r} in {filename}")
+                raise ValueError(
+                    f"Inconsistent parameter grid for {key!r} in {filename}"
+                )
             continue
 
         if key not in concat_buffers:
@@ -60,7 +63,9 @@ for key, values in concat_buffers.items():
 
 def get_parameter_values(raw_outputs):
     if "prestige_gains" in raw_outputs:
-        return "prestige_gain", np.asarray(raw_outputs["prestige_gains"], dtype=np.float64)
+        return "prestige_gain", np.asarray(
+            raw_outputs["prestige_gains"], dtype=np.float64
+        )
     return "fee", np.asarray(raw_outputs["fees"], dtype=np.float64)
 
 
@@ -115,7 +120,7 @@ def plot_preliminary_innovation_decay(raw_outputs):
 rows = []
 for seed_idx, seed in enumerate(outputs["seeds"]):
     for parameter_idx, parameter_value in enumerate(parameter_values):
-        for t in range(outputs["T"]):
+        for t in range(int(outputs["T"])):
             if t % sampling_interval != 0:
                 continue
             rows.append(
@@ -134,7 +139,7 @@ for seed_idx, seed in enumerate(outputs["seeds"]):
 
 df = pd.DataFrame(rows)
 
-df = df[df[parameter_name] >= 0.0]
+# df = df[df[parameter_name] >= 0.0]
 
 max_total_l = float(outputs.get("max_total_l", 5000))
 df["mean_traits"] = df["mean_traits"] / max_total_l
