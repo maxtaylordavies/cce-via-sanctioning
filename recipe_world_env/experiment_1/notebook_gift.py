@@ -41,8 +41,8 @@ MAX_EXPANSION_LEN = max(
     ]
 )
 MAX_RULE_LEN = max(MAX_TARGET_LEN, MAX_EXPANSION_LEN)
-MAX_PLANT_LEN = 25
-MAX_COMPLEXITY_LEVEL = 15
+MAX_PLANT_LEN = 20
+MAX_COMPLEXITY_LEVEL = 10
 MAX_RECIPE_LEN = MAX_COMPLEXITY_LEVEL + 10
 MAX_LIBRARY_SIZE = 50
 EMPTY_RECIPE_ID = -1
@@ -96,11 +96,7 @@ PLANT_POSITIONS = jnp.arange(MAX_PLANT_LEN, dtype=jnp.int32)
 RULE_OFFSETS = jnp.arange(MAX_RULE_LEN, dtype=jnp.int32)
 
 OP_PROBS = jnp.array(
-    [
-        0.4,
-        0.4,
-        0.2,
-    ]
+    [0.4, 0.4, 0.2]
 )  # probabilities for add, delete, combine operations during innovation
 OP_THRESHOLDS = jnp.cumsum(OP_PROBS)
 
@@ -113,7 +109,7 @@ def choose_innov_op(key):
 
 @jax.jit
 def get_acceptance_prob(delta):
-    p_min, p_max, tau = 0.05, 0.95, 0.5
+    p_min, p_max, tau = 0.0, 1.0, 0.5
     return p_min + (p_max - p_min) * jax.nn.sigmoid(delta / tau)
 
 
@@ -479,6 +475,38 @@ def innovate(key, library, recipe_ages, recipe_ids):
 
 
 @partial(jax.jit, static_argnames=["n_agents"])
+def choose_demonstrator(
+    key,
+    can_imitate,
+    prestiges,
+    n_agents,
+    prestige_bias,
+    demonstrator_prestige_baseline,
+):
+    prestige_scores = (
+        demonstrator_prestige_baseline + jnp.maximum(prestiges, 0.0)
+    ) ** prestige_bias
+    weights = jnp.where(can_imitate, prestige_scores, 0.0)
+    weights = jnp.where(weights.sum() > 0, weights, can_imitate.astype(jnp.float32))
+    p = weights / weights.sum()
+    return jax.random.choice(key, n_agents, p=p)
+
+
+@jax.jit
+def compute_gift(
+    demonstrator_prestige,
+    gift_rate,
+    gift_base,
+    gift_exponent,
+    gift_cap,
+):
+    raw_gift = gift_base + gift_rate * (
+        jnp.maximum(demonstrator_prestige, 0.0) ** gift_exponent
+    )
+    return jnp.minimum(raw_gift, gift_cap)
+
+
+@partial(jax.jit, static_argnames=["n_agents"])
 def imitate_recipe(
     key,
     libraries,
@@ -488,12 +516,25 @@ def imitate_recipe(
     n_agents,
     best_recipe_idxs,
     recipe_ages,
+    prestiges,
+    prestige_bias,
+    demonstrator_prestige_baseline,
+    gift_rate,
+    gift_base,
+    gift_exponent,
+    gift_cap,
 ):
     key_agent, _ = jax.random.split(key)
 
-    # select random neighbour to imitate from
-    p = can_imitate / can_imitate.sum()
-    demonstrator_idx = jax.random.choice(key_agent, n_agents, p=p)
+    # select neighbour to imitate from, biased by prestige
+    demonstrator_idx = choose_demonstrator(
+        key_agent,
+        can_imitate,
+        prestiges,
+        n_agents,
+        prestige_bias,
+        demonstrator_prestige_baseline,
+    )
 
     # select the recipe that contributed most to the demonstrator's yield in the most recent batch
     recipe_idx = best_recipe_idxs[demonstrator_idx]
@@ -511,6 +552,14 @@ def imitate_recipe(
         .set(libraries[demonstrator_idx, recipe_idx]),
         insert_idx,
         recipe_ids[demonstrator_idx, recipe_idx],
+        demonstrator_idx,
+        compute_gift(
+            prestiges[demonstrator_idx],
+            gift_rate,
+            gift_base,
+            gift_exponent,
+            gift_cap,
+        ),
     )
 
 
@@ -528,11 +577,19 @@ def run_simulation_loop(
     n_forage=10,
     n_innov_attempts=3,
     innov_cost=1.0,
-    imit_dist_threshold=1,
+    imit_dist_threshold=100,
     learning_rate=0.1,
     p_death=0.001,
     prestige_decay=0.01,
-    prestige_value=1.0,
+    prestige_value=0.0,
+    prestige_bias=1.0,
+    demonstrator_prestige_baseline=1.0,
+    gift_rate=0.1,
+    gift_base=0.0,
+    gift_exponent=1.0,
+    gift_cap=jnp.inf,
+    eligibility_trace_decay=0.5,
+    eligibility_discount=1.0,
 ):
     n_agents = grid_length**2
     max_recipe_ids = NUM_RULES_IN_INITIAL_LIBRARY + (T * n_agents)
@@ -585,6 +642,13 @@ def run_simulation_loop(
         roles,
         best_recipe_idxs,
         recipe_ages,
+        prestiges,
+        prestige_bias,
+        demonstrator_prestige_baseline,
+        gift_rate,
+        gift_base,
+        gift_exponent,
+        gift_cap,
     ):
         # ROLE KEY: 0 = innovate, 1 = imitate
         innov_key, adopt_key = jax.random.split(key)
@@ -621,10 +685,18 @@ def run_simulation_loop(
                 EMPTY_RECIPE_ID,
                 parent_1_ids[best_innov_idx],
                 parent_2_ids[best_innov_idx],
+                agent_idx,
+                jnp.asarray(0.0, dtype=jnp.float32),
             )
 
         def do_imitate(_):
-            imitation_library, new_idx, copied_recipe_id = imitate_recipe(
+            (
+                imitation_library,
+                new_idx,
+                copied_recipe_id,
+                demonstrator_idx,
+                gift,
+            ) = imitate_recipe(
                 key,
                 libraries,
                 recipe_ids,
@@ -633,6 +705,13 @@ def run_simulation_loop(
                 n_agents,
                 best_recipe_idxs,
                 recipe_ages,
+                prestiges,
+                prestige_bias,
+                demonstrator_prestige_baseline,
+                gift_rate,
+                gift_base,
+                gift_exponent,
+                gift_cap,
             )
             imitation_yield = compute_new_avg_yield(imitation_library, new_idx)
             return (
@@ -642,6 +721,8 @@ def run_simulation_loop(
                 copied_recipe_id,
                 EMPTY_RECIPE_ID,
                 EMPTY_RECIPE_ID,
+                demonstrator_idx,
+                gift,
             )
 
         # obtain new library (and corresponding yield) based on chosen role
@@ -652,6 +733,8 @@ def run_simulation_loop(
             copied_recipe_id,
             parent_1_id,
             parent_2_id,
+            demonstrator_idx,
+            gift,
         ) = jax.lax.cond(
             roles[agent_idx] == ROLE_INNOVATE,
             do_innovate,
@@ -664,9 +747,10 @@ def run_simulation_loop(
         action_cost = jnp.where(
             chosen_role == ROLE_INNOVATE,
             innovation_cost,
-            0.0,
+            gift,
         )
-        can_afford_action = action_cost <= energies[agent_idx]
+        can_afford_action = True
+        # can_afford_action = action_cost <= energies[agent_idx]
 
         # An agent who cannot afford the chosen action leaves their library
         # unchanged and pays no role-specific cost.
@@ -691,13 +775,34 @@ def run_simulation_loop(
             copied_recipe_id,
             parent_1_id,
             parent_2_id,
+            demonstrator_idx,
+            gift,
         )
 
     # (keys, agent_idxs, libraries, recipe_ids, plants, levels, roles, best_recipe_idxs, recipe_ages)
     # -> updated_libraries, yield_deltas, delta_sizes, updated_ages, accepts, update_idxs, copied_recipe_ids, parent_1_ids, parent_2_ids
     vmapped_update_library = jax.vmap(
         update_library,
-        in_axes=(0, 0, 0, None, None, None, None, None, None, None, None),
+        in_axes=(
+            0,
+            0,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ),
     )
 
     # (libraries) -> library_entropies
@@ -720,6 +825,7 @@ def run_simulation_loop(
             recipe_creator_agent_ids,
             recipe_birth_timesteps,
             prestiges,
+            eligibilities,
         ) = carry
 
         # get new keys
@@ -746,6 +852,7 @@ def run_simulation_loop(
         recipe_ids = jnp.where(deaths[:, None], initial_recipe_ids, recipe_ids)
         recipe_ages = jnp.where(deaths[:, None], 0, recipe_ages + 1)
         prestiges = jnp.where(deaths, 0.0, prestiges)
+        eligibilities = jnp.where(deaths[:, None], 0.0, eligibilities)
         prestiges = prestiges * (1.0 - prestige_decay)
 
         # each agent forages a plant based on their current energy level
@@ -772,6 +879,8 @@ def run_simulation_loop(
             copied_recipe_ids,
             parent_1_ids,
             parent_2_ids,
+            demonstrator_idxs,
+            gifts,
         ) = vmapped_update_library(
             innov_keys,
             jnp.arange(n_agents),
@@ -784,6 +893,13 @@ def run_simulation_loop(
             roles,
             best_recipe_idxs,
             recipe_ages,
+            prestiges,
+            prestige_bias,
+            demonstrator_prestige_baseline,
+            gift_rate,
+            gift_base,
+            gift_exponent,
+            gift_cap,
         )
 
         slot_mask = jnp.arange(MAX_LIBRARY_SIZE)[None, :] == update_idxs[:, None]
@@ -791,6 +907,12 @@ def run_simulation_loop(
         accepted_innovations = accepts & (roles == ROLE_INNOVATE)
         affordable_imitations = can_afford_actions & (roles == ROLE_IMITATE)
         affordable_innovations = can_afford_actions & (roles == ROLE_INNOVATE)
+        outgoing_gifts = jnp.where(affordable_imitations, gifts, 0.0)
+        incoming_gifts = (
+            jnp.zeros(n_agents, dtype=jnp.float32)
+            .at[demonstrator_idxs]
+            .add(outgoing_gifts)
+        )
 
         recipe_ids = jnp.where(
             accepted_imitations[:, None] & slot_mask,
@@ -837,20 +959,28 @@ def run_simulation_loop(
             0.0,
         )
         costs = foraging_cost(foraged_levels.mean(axis=1)) + role_costs
+        costs += outgoing_gifts
 
         # update each agent's energy
-        delta_energies = avg_yields - costs
+        delta_energies = avg_yields - costs + incoming_gifts
         # energies = jnp.clip(energies + delta_energies, 0, MAX_ENERGY)
         energies = jnp.minimum(energies + delta_energies, MAX_ENERGY)
 
-        prestige_changes = prestige_gain * accepted_innovations.astype(jnp.float32)
+        # prestige_changes = prestige_gain * accepted_innovations.astype(jnp.float32)
+        prestige_changes = prestige_gain * (roles == ROLE_INNOVATE).astype(jnp.float32)
         new_prestiges = prestiges + prestige_changes
 
-        # update q-values based on reward prediction error
+        # update q-values using an eligibility trace over recent role choices.
         rewards = yield_deltas - role_costs
+        rewards += incoming_gifts - outgoing_gifts
         rewards += prestige_value * prestige_changes
         rpe = rewards - q_vals[jnp.arange(n_agents), roles]
-        new_q_vals = q_vals.at[jnp.arange(n_agents), roles].add(learning_rate * rpe)
+        decayed_eligibilities = (
+            eligibility_discount * eligibility_trace_decay * eligibilities
+        )
+        role_eligibilities = jax.nn.one_hot(roles, 2, dtype=eligibilities.dtype)
+        new_eligibilities = decayed_eligibilities + role_eligibilities
+        new_q_vals = q_vals + learning_rate * (rpe[:, None] * new_eligibilities)
 
         # compute average reward for each role
         total_n_innov, total_n_imit = (roles == ROLE_INNOVATE).sum(), (
@@ -865,6 +995,8 @@ def run_simulation_loop(
         avg_rewards = jnp.array([avg_reward_innov, avg_reward_imit])
         mean_prestige = new_prestiges.mean()
         max_prestige = new_prestiges.max()
+        total_gifts = outgoing_gifts.sum()
+        max_gift_income = incoming_gifts.max()
 
         return (
             key,
@@ -882,7 +1014,16 @@ def run_simulation_loop(
             recipe_creator_agent_ids,
             recipe_birth_timesteps,
             new_prestiges,
-        ), (foraged_levels.mean(axis=-1), avg_yields, avg_rewards, roles, accepts)
+            new_eligibilities,
+        ), (
+            foraged_levels.mean(axis=-1),
+            avg_yields,
+            avg_rewards,
+            roles,
+            accepts,
+            total_gifts,
+            max_gift_income,
+        )
 
     libraries = jnp.tile(initial_library[None, ...], (n_agents, 1, 1))
     energies = jnp.zeros(n_agents, dtype=jnp.float32)
@@ -900,6 +1041,7 @@ def run_simulation_loop(
     )
     recipe_birth_timesteps = jnp.full(max_recipe_ids, -1, dtype=jnp.int32)
     prestiges = jnp.zeros(n_agents, dtype=jnp.float32)
+    eligibilities = jnp.zeros((n_agents, 2), dtype=jnp.float32)
 
     carry = (
         key,
@@ -917,6 +1059,7 @@ def run_simulation_loop(
         recipe_creator_agent_ids,
         recipe_birth_timesteps,
         prestiges,
+        eligibilities,
     )
 
     carry, metrics = jax.lax.scan(body_fn, carry, jnp.arange(T))
@@ -946,13 +1089,21 @@ def run_simulation_loop(
 
 
 seeds = [0, 1, 2]
-grid_length, T_main, T_extra = 10, int(1e4), 500
+grid_length, T_main, T_extra = 10, int(1e4), 200
 T = (
     T_main + T_extra
 )  # total timesteps to run (including extra for averaging agent metrics at the end)
-prestige_gain_vals = jnp.linspace(0.0, 10.0, 21)
+prestige_gain_vals = jnp.linspace(0.0, 1.0, 21)
 prestige_decay = 0.01
-prestige_value = 1.0
+prestige_value = 0.0
+prestige_bias = 1.0
+demonstrator_prestige_baseline = 1.0
+gift_rate = 0.1
+gift_base = 0.0
+gift_exponent = 1.0
+gift_cap = np.float32(np.inf)
+eligibility_trace_decay = 0.5
+eligibility_discount = 1.0
 
 
 def run_with_prestige_gain(key, plants, prestige_gain):
@@ -966,6 +1117,14 @@ def run_with_prestige_gain(key, plants, prestige_gain):
             final_phase=T_extra,
             prestige_decay=prestige_decay,
             prestige_value=prestige_value,
+            prestige_bias=prestige_bias,
+            demonstrator_prestige_baseline=demonstrator_prestige_baseline,
+            gift_rate=gift_rate,
+            gift_base=gift_base,
+            gift_exponent=gift_exponent,
+            gift_cap=gift_cap,
+            eligibility_trace_decay=eligibility_trace_decay,
+            eligibility_discount=eligibility_discount,
         )
     )
 
@@ -975,6 +1134,8 @@ all_agent_yields = []
 all_pop_role_rewards = []
 all_agent_roles = []
 all_agent_accepts = []
+all_pop_total_gifts = []
+all_pop_max_gift_income = []
 all_final_libraries = []
 all_final_recipe_ids = []
 all_final_agent_ids = []
@@ -993,6 +1154,8 @@ for seed in tqdm(seeds):
         pop_role_rewards,
         agent_roles,
         agent_accepts,
+        pop_total_gifts,
+        pop_max_gift_income,
         final_libraries,
         final_recipe_ids,
         final_agent_ids,
@@ -1011,6 +1174,8 @@ for seed in tqdm(seeds):
     all_pop_role_rewards.append(np.asarray(pop_role_rewards))
     all_agent_roles.append(np.asarray(agent_roles))
     all_agent_accepts.append(np.asarray(agent_accepts))
+    all_pop_total_gifts.append(np.asarray(pop_total_gifts))
+    all_pop_max_gift_income.append(np.asarray(pop_max_gift_income))
     all_final_libraries.append(np.asarray(final_libraries))
     all_final_recipe_ids.append(np.asarray(final_recipe_ids))
     all_final_agent_ids.append(np.asarray(final_agent_ids))
@@ -1038,7 +1203,15 @@ simulation_outputs = {
     "grid_length": np.int32(grid_length),
     "prestige_decay": np.float32(prestige_decay),
     "prestige_value": np.float32(prestige_value),
-    "model_variant": np.asarray("intrinsic_prestige"),
+    "prestige_bias": np.float32(prestige_bias),
+    "demonstrator_prestige_baseline": np.float32(demonstrator_prestige_baseline),
+    "gift_rate": np.float32(gift_rate),
+    "gift_base": np.float32(gift_base),
+    "gift_exponent": np.float32(gift_exponent),
+    "gift_cap": np.float32(gift_cap),
+    "eligibility_trace_decay": np.float32(eligibility_trace_decay),
+    "eligibility_discount": np.float32(eligibility_discount),
+    "model_variant": np.asarray("prestige_gift"),
     "num_rules_in_initial_library": np.int32(NUM_RULES_IN_INITIAL_LIBRARY),
     "empty_recipe_id": np.int32(EMPTY_RECIPE_ID),
     "role_innovate": np.int32(ROLE_INNOVATE),
@@ -1048,6 +1221,8 @@ simulation_outputs = {
     # "pop_role_rewards": np.stack(all_pop_role_rewards, axis=0),
     "agent_roles": np.stack(all_agent_roles, axis=0),
     # "agent_accepts": np.stack(all_agent_accepts, axis=0),
+    # "pop_total_gifts": np.stack(all_pop_total_gifts, axis=0),
+    # "pop_max_gift_income": np.stack(all_pop_max_gift_income, axis=0),
     # "final_libraries": np.stack(all_final_libraries, axis=0),
     # "final_recipe_ids": np.stack(all_final_recipe_ids, axis=0),
     # "final_agent_ids": np.stack(all_final_agent_ids, axis=0),
@@ -1055,4 +1230,4 @@ simulation_outputs = {
     # "final_next_recipe_ids": np.stack(all_final_next_recipe_ids, axis=0),
     # "recipe_lineage_arrays": np.stack(all_recipe_lineage_arrays, axis=0),
 }
-np.savez(f"simulation_outputs_{seeds[0]}-{seeds[-1]}.npz", **simulation_outputs)
+np.savez(f"simulation_outputs_gift_{seeds[0]}-{seeds[-1]}.npz", **simulation_outputs)

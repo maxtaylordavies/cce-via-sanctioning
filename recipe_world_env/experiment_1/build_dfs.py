@@ -274,7 +274,7 @@ def build_population_df(outputs):
     t_main = int(outputs["T_main"])
     agent_levels = outputs["agent_levels"]
     agent_yields = outputs["agent_yields"]
-    pop_role_rewards = outputs["pop_role_rewards"]
+    # pop_role_rewards = outputs["pop_role_rewards"]
     agent_roles = outputs["agent_roles"]
     role_innovate = int(outputs["role_innovate"])
     role_imitate = int(outputs["role_imitate"])
@@ -297,12 +297,12 @@ def build_population_df(outputs):
                         "t": t,
                         "level": float(pop_levels[seed_idx, fee_idx, t]),
                         "yield": float(pop_yields[seed_idx, fee_idx, t]),
-                        "r_innov": float(
-                            pop_role_rewards[seed_idx, fee_idx, t, role_innovate]
-                        ),
-                        "r_imit": float(
-                            pop_role_rewards[seed_idx, fee_idx, t, 1 - role_innovate]
-                        ),
+                        # "r_innov": float(
+                        #     pop_role_rewards[seed_idx, fee_idx, t, role_innovate]
+                        # ),
+                        # "r_imit": float(
+                        #     pop_role_rewards[seed_idx, fee_idx, t, 1 - role_innovate]
+                        # ),
                         "prop_innov": float(pop_prop_innovs[seed_idx, fee_idx, t]),
                         "prop_imit": float(pop_prop_imits[seed_idx, fee_idx, t]),
                         "yield_gini": float(pop_yield_ginis[seed_idx, fee_idx, t]),
@@ -343,7 +343,7 @@ def build_population_run_summary_df(outputs):
     seeds = outputs["seeds"]
     agent_roles = outputs["agent_roles"]
     agent_accepts = outputs["agent_accepts"] if "agent_accepts" in outputs else None
-    final_next_recipe_ids = outputs["final_next_recipe_ids"]
+    # final_next_recipe_ids = outputs["final_next_recipe_ids"]
     num_rules_in_initial_library = int(outputs["num_rules_in_initial_library"])
     role_imitate = int(outputs["role_imitate"])
 
@@ -351,6 +351,7 @@ def build_population_run_summary_df(outputs):
     for seed_idx, seed in enumerate(seeds):
         for fee_idx, fee in enumerate(fees):
             imitation_attempts = agent_roles[seed_idx, fee_idx] == role_imitate
+            innovation_attempts = ~imitation_attempts
             if agent_accepts is None:
                 successful_imitation_events = int(imitation_attempts.sum())
             else:
@@ -364,10 +365,11 @@ def build_population_run_summary_df(outputs):
                 {
                     "seed": int(seed),
                     "fee": float(fee),
-                    "n_innovation_events": int(
-                        final_next_recipe_ids[seed_idx, fee_idx]
-                        - num_rules_in_initial_library
-                    ),
+                    # "n_innovation_events": int(
+                    #     final_next_recipe_ids[seed_idx, fee_idx]
+                    #     - num_rules_in_initial_library
+                    # ),
+                    "n_innovation_events": int(innovation_attempts.sum()),
                     "n_imitation_events": successful_imitation_events,
                 }
             )
@@ -592,6 +594,7 @@ scalar_keys = {
     "role_innovate",
     "role_imitate",
 }
+parameter_keys = {"fees", "prestige_gains"}
 
 outputs = {}
 concat_buffers = {}
@@ -602,18 +605,20 @@ for filename in sorted(os.listdir(DATA_DIR)):
     for key in file_outputs.files:
         value = file_outputs[key]
 
-        if key in scalar_keys:
-            if key not in outputs:
-                outputs[key] = value
-            elif outputs[key] != value:
-                raise ValueError(f"Inconsistent scalar value for {key!r} in {filename}")
-            continue
-
-        if key == "fees":
+        if key in scalar_keys or value.shape == ():
             if key not in outputs:
                 outputs[key] = value
             elif not np.array_equal(outputs[key], value):
-                raise ValueError(f"Inconsistent fee grid in {filename}")
+                raise ValueError(f"Inconsistent scalar value for {key!r} in {filename}")
+            continue
+
+        if key in parameter_keys:
+            if key not in outputs:
+                outputs[key] = value
+            elif not np.array_equal(outputs[key], value):
+                raise ValueError(
+                    f"Inconsistent parameter grid for {key!r} in {filename}"
+                )
             continue
 
         if key not in concat_buffers:
@@ -626,15 +631,15 @@ for key, values in concat_buffers.items():
 population_data = build_population_df(outputs)
 agent_data = build_agent_df(outputs)
 population_run_summary = build_population_run_summary_df(outputs)
-recipe_lineage_data = build_recipe_dfs(outputs)
-recipe_descendant_data = build_recipe_descendant_df(outputs)
-recipe_recombination_data = build_recipe_recombination_df(outputs)
+# recipe_lineage_data = build_recipe_dfs(outputs)
+# recipe_descendant_data = build_recipe_descendant_df(outputs)
+# recipe_recombination_data = build_recipe_recombination_df(outputs)
 
 for df in (
     population_run_summary,
-    recipe_lineage_data,
-    recipe_descendant_data,
-    recipe_recombination_data,
+    # recipe_lineage_data,
+    # recipe_descendant_data,
+    # recipe_recombination_data,
     population_data,
 ):
     df["fee_axis_value"] = get_fee_axis_values(df["fee"])
@@ -643,9 +648,9 @@ for df in (
 population_data.to_csv(DATA_DIR / "population_data.csv", index=False)
 agent_data.to_csv(DATA_DIR / "agent_data.csv", index=False)
 population_run_summary.to_csv(DATA_DIR / "population_run_summary.csv", index=False)
-recipe_lineage_data.to_csv(DATA_DIR / "recipe_lineage_data.csv", index=False)
-recipe_descendant_data.to_csv(DATA_DIR / "recipe_descendant_data.csv", index=False)
-recipe_recombination_data.to_csv(
-    DATA_DIR / "recipe_recombination_data.csv", index=False
-)
+# recipe_lineage_data.to_csv(DATA_DIR / "recipe_lineage_data.csv", index=False)
+# recipe_descendant_data.to_csv(DATA_DIR / "recipe_descendant_data.csv", index=False)
+# recipe_recombination_data.to_csv(
+#     DATA_DIR / "recipe_recombination_data.csv", index=False
+# )
 # np.save(DATA_DIR / "jaccard_matrices.npy", outputs["jaccard_matrices"])

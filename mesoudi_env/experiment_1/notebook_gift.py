@@ -7,7 +7,7 @@ from tqdm import tqdm
 
 ROLE_INNOVATE, ROLE_IMITATE = 0, 1
 L = 100
-MAX_TOTAL_L = 10000
+MAX_TOTAL_L = 5000
 
 
 @jax.jit
@@ -175,6 +175,8 @@ def run_simulation_loop(
     gift_base=0.0,
     gift_exponent=1.0,
     gift_cap=jnp.inf,
+    eligibility_trace_decay=0.8,
+    eligibility_discount=1.0,
 ):
     # Compute pairwise toroidal distances between agents for imitation.
     N = grid_length**2
@@ -195,7 +197,7 @@ def run_simulation_loop(
     )
 
     def body_fn(carry, t):
-        key, curr_L, all_traits, all_q_vals, all_prestiges = carry
+        key, curr_L, all_traits, all_q_vals, all_prestiges, all_eligibilities = carry
 
         # get new keys
         key, death_key, role_key, update_key = jax.random.split(key, 4)
@@ -205,6 +207,7 @@ def run_simulation_loop(
         all_traits = jnp.where(deaths[:, None], 0, all_traits)
         all_q_vals = jnp.where(deaths[:, None], init_q, all_q_vals)
         all_prestiges = jnp.where(deaths, 0, all_prestiges)
+        all_eligibilities = jnp.where(deaths[:, None], 0.0, all_eligibilities)
         all_prestiges = all_prestiges * (1.0 - prestige_decay)
 
         # agents select roles
@@ -241,8 +244,8 @@ def run_simulation_loop(
         new_all_prestiges = all_prestiges + prestige_changes
         new_trait_payoffs = compute_trait_payoffs(new_all_traits, b)
 
-        incoming_gifts = jnp.zeros((N,), dtype=jnp.float32).at[demonstrator_idxs].add(
-            gifts_paid
+        incoming_gifts = (
+            jnp.zeros((N,), dtype=jnp.float32).at[demonstrator_idxs].add(gifts_paid)
         )
         transfer_rewards = incoming_gifts - gifts_paid
 
@@ -252,10 +255,15 @@ def run_simulation_loop(
         rewards -= jnp.where(all_roles == ROLE_INNOVATE, innov_cost, 0)
         rewards += prestige_value * prestige_changes
 
-        # update q vals
+        # update q vals using an eligibility trace over recent role choices.
         rpe = rewards - all_q_vals[jnp.arange(N), all_roles]
-        new_all_q_vals = all_q_vals.at[jnp.arange(N), all_roles].add(
-            learning_rate * rpe
+        decayed_eligibilities = (
+            eligibility_discount * eligibility_trace_decay * all_eligibilities
+        )
+        role_eligibilities = jax.nn.one_hot(all_roles, 2, dtype=all_eligibilities.dtype)
+        new_all_eligibilities = decayed_eligibilities + role_eligibilities
+        new_all_q_vals = all_q_vals + learning_rate * (
+            rpe[:, None] * new_all_eligibilities
         )
 
         # compute some metrics for logging
@@ -270,7 +278,14 @@ def run_simulation_loop(
         unlock = (mean_prop_known >= 0.9) & (curr_L < MAX_TOTAL_L)
         new_L = jnp.where(unlock, curr_L + L, curr_L)
 
-        return (key, new_L, new_all_traits, new_all_q_vals, new_all_prestiges), (
+        return (
+            key,
+            new_L,
+            new_all_traits,
+            new_all_q_vals,
+            new_all_prestiges,
+            new_all_eligibilities,
+        ), (
             mean_traits_known,
             most_traits_known,
             total_unique_traits_known,
@@ -289,6 +304,7 @@ def run_simulation_loop(
         jnp.zeros((N, MAX_TOTAL_L), dtype=jnp.int8),  # all_traits
         jnp.full((N, 2), init_q, dtype=jnp.float32),  # all_q_vals
         jnp.zeros((N,), dtype=jnp.float32),  # all_prestiges
+        jnp.zeros((N, 2), dtype=jnp.float32),  # all_eligibilities
     )
 
     _, metrics = jax.lax.scan(body_fn, carry, jnp.arange(T))
@@ -302,7 +318,7 @@ def run_simulation_loop(
 def main():
     seeds = list(range(5))
     grid_length, T = 10, int(2e3)
-    prestige_gain_vals = jnp.linspace(0.0, 1.0, 21)
+    prestige_gain_vals = jnp.linspace(0.0, 10.0, 21)
     prestige_decay = 0.01
     prestige_value = 0.0
     prestige_bias = 1.0
@@ -311,6 +327,8 @@ def main():
     gift_base = 0.0
     gift_exponent = 1.0
     gift_cap = np.float32(np.inf)
+    eligibility_trace_decay = 0.8
+    eligibility_discount = 1.0
 
     def run_with_prestige_gain(key, prestige_gain):
         return jax.block_until_ready(
@@ -327,6 +345,8 @@ def main():
                 gift_base=gift_base,
                 gift_exponent=gift_exponent,
                 gift_cap=gift_cap,
+                eligibility_trace_decay=eligibility_trace_decay,
+                eligibility_discount=eligibility_discount,
             )
         )
 
@@ -376,13 +396,13 @@ def main():
         "prestige_decay": np.float32(prestige_decay),
         "prestige_value": np.float32(prestige_value),
         "prestige_bias": np.float32(prestige_bias),
-        "demonstrator_prestige_baseline": np.float32(
-            demonstrator_prestige_baseline
-        ),
+        "demonstrator_prestige_baseline": np.float32(demonstrator_prestige_baseline),
         "gift_rate": np.float32(gift_rate),
         "gift_base": np.float32(gift_base),
         "gift_exponent": np.float32(gift_exponent),
         "gift_cap": np.float32(gift_cap),
+        "eligibility_trace_decay": np.float32(eligibility_trace_decay),
+        "eligibility_discount": np.float32(eligibility_discount),
         "role_innovate": np.int32(ROLE_INNOVATE),
         "role_imitate": np.int32(ROLE_IMITATE),
         "mean_traits": np.stack(all_mean_traits, axis=0),
