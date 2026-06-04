@@ -41,8 +41,8 @@ MAX_EXPANSION_LEN = max(
     ]
 )
 MAX_RULE_LEN = max(MAX_TARGET_LEN, MAX_EXPANSION_LEN)
-MAX_PLANT_LEN = 25
-MAX_COMPLEXITY_LEVEL = 15
+MAX_PLANT_LEN = 20
+MAX_COMPLEXITY_LEVEL = 10
 MAX_RECIPE_LEN = MAX_COMPLEXITY_LEVEL + 10
 MAX_LIBRARY_SIZE = 50
 EMPTY_RECIPE_ID = -1
@@ -113,7 +113,7 @@ def choose_innov_op(key):
 
 @jax.jit
 def get_acceptance_prob(delta):
-    p_min, p_max, tau = 0.05, 0.95, 0.5
+    p_min, p_max, tau = 0.0, 1.0, 0.5
     return p_min + (p_max - p_min) * jax.nn.sigmoid(delta / tau)
 
 
@@ -528,7 +528,7 @@ def run_simulation_loop(
     n_forage=10,
     n_innov_attempts=3,
     innov_cost=1.0,
-    imit_dist_threshold=1,
+    imit_dist_threshold=100,
     learning_rate=0.1,
     p_death=0.001,
     prestige_decay=0.01,
@@ -945,12 +945,12 @@ def run_simulation_loop(
     )
 
 
-seeds = [0, 1, 2]
-grid_length, T_main, T_extra = 10, int(1e4), 500
+seeds = [0]
+grid_length, T_main, T_extra = 10, int(1e4), 200
 T = (
     T_main + T_extra
 )  # total timesteps to run (including extra for averaging agent metrics at the end)
-prestige_gain_vals = jnp.linspace(0.0, 10.0, 21)
+prestige_gain_vals = 10 * jnp.linspace(0.0, 1.0, 21)
 prestige_decay = 0.01
 prestige_value = 1.0
 

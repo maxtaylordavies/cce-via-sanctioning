@@ -166,7 +166,7 @@ def run_simulation_loop(
     init_q=1.0,
     choice_beta=0.1,
     learning_rate=0.1,
-    imit_dist_threshold=1,
+    imit_dist_threshold=100,
     prestige_decay=0.01,
     prestige_value=0.0,
     prestige_bias=1.0,
@@ -175,7 +175,7 @@ def run_simulation_loop(
     gift_base=0.0,
     gift_exponent=1.0,
     gift_cap=jnp.inf,
-    eligibility_trace_decay=0.8,
+    eligibility_trace_decay=0.5,
     eligibility_discount=1.0,
 ):
     # Compute pairwise toroidal distances between agents for imitation.
@@ -317,8 +317,8 @@ def run_simulation_loop(
 
 def main():
     seeds = list(range(5))
-    grid_length, T = 10, int(2e3)
-    prestige_gain_vals = jnp.linspace(0.0, 10.0, 21)
+    grid_length, T = 10, int(4e3)
+    prestige_gain_vals = 10 * jnp.linspace(0.0, 1.0, 21)
     prestige_decay = 0.01
     prestige_value = 0.0
     prestige_bias = 1.0
@@ -327,7 +327,7 @@ def main():
     gift_base = 0.0
     gift_exponent = 1.0
     gift_cap = np.float32(np.inf)
-    eligibility_trace_decay = 0.8
+    eligibility_trace_decay = 0.5
     eligibility_discount = 1.0
 
     def run_with_prestige_gain(key, prestige_gain):

@@ -6,7 +6,7 @@ from tqdm import tqdm
 
 ROLE_INNOVATE, ROLE_IMITATE = 0, 1
 L = 100
-MAX_TOTAL_L = 10000
+MAX_TOTAL_L = 5000
 
 
 @jax.jit
@@ -24,10 +24,22 @@ def innovate(key, traits, curr_L, p_i):
 
 
 @jax.jit
+def choose_demonstrator(key, can_imitate, agent_idx):
+    weights = jnp.where(can_imitate[agent_idx], 1.0, 0.0)
+
+    fallback_mask = jnp.arange(can_imitate.shape[0]) != agent_idx
+    fallback_weights = jnp.where(fallback_mask, 1.0, 0.0)
+    weights = jnp.where(weights.sum() > 0, weights, fallback_weights)
+    logits = jnp.where(weights > 0, jnp.log(weights), -jnp.inf)
+    return jax.random.categorical(key, logits)
+
+
+@jax.jit
 def imitate(key, all_traits, can_imitate, agent_idx, p_c):
-    copied_traits = (all_traits * can_imitate[agent_idx].reshape(-1, 1)).sum(axis=0) > 0
-    copied_traits = copied_traits & jax.random.bernoulli(
-        key, p_c, shape=copied_traits.shape
+    demonstrator_key, copy_key = jax.random.split(key)
+    demonstrator_idx = choose_demonstrator(demonstrator_key, can_imitate, agent_idx)
+    copied_traits = all_traits[demonstrator_idx] & jax.random.bernoulli(
+        copy_key, p_c, shape=all_traits.shape[1:]
     )
     new = all_traits[agent_idx] | copied_traits
     n_changed = (new & ~all_traits[agent_idx]).sum()
@@ -77,7 +89,7 @@ def run_simulation_loop(
     init_q=1.0,
     choice_beta=0.1,
     learning_rate=0.1,
-    imit_dist_threshold=1,
+    imit_dist_threshold=100,
     prestige_decay=0.01,
     prestige_value=1.0,
 ):
@@ -180,8 +192,8 @@ def run_simulation_loop(
 
 def main():
     seeds = list(range(5))
-    grid_length, T = 10, int(2e3)
-    prestige_gain_vals = jnp.linspace(0.0, 1.0, 21)
+    grid_length, T = 10, int(4e3)
+    prestige_gain_vals = 2 * jnp.linspace(0.0, 1.0, 21)
     prestige_decay = 0.01
     prestige_value = 1.0
 

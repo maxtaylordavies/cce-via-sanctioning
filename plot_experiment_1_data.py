@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from pathlib import Path
+import sys
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -16,20 +17,19 @@ sns.set_style("whitegrid")
 class EnvironmentConfig:
     name: str
     title: str
-    data_dir: Path
     score_key: str
     score_normalizer: float | str
     role_source: str
     final_window: int | str = 500
     role_window: int = 1000
     sample_interval: int = 20
+    data_dir: Path = Path("data")
 
 
 ENVIRONMENTS = (
     EnvironmentConfig(
         name="mesoudi_env",
         title="Binary trait env",
-        data_dir=Path("data/mesoudi_env/experiment_1/gift"),
         score_key="mean_traits",
         score_normalizer="max_total_l",
         role_source="role_probs",
@@ -39,7 +39,6 @@ ENVIRONMENTS = (
     EnvironmentConfig(
         name="miu_env",
         title="Refinement bandit env",
-        data_dir=Path("data/miu_env/experiment_1/gift"),
         score_key="payoffs",
         score_normalizer=1.0,
         role_source="role_probs",
@@ -49,7 +48,6 @@ ENVIRONMENTS = (
     EnvironmentConfig(
         name="recipe_world_env",
         title="Recipe grammar env",
-        data_dir=Path("data/recipe_world_env/experiment_1"),
         score_key="agent_yields",
         score_normalizer=10.0,
         role_source="agent_roles",
@@ -57,6 +55,10 @@ ENVIRONMENTS = (
         role_window=1000,
     ),
 )
+
+
+def get_data_path(config, variant):
+    return Path(f"data/{config.name}/experiment_1/{variant}")
 
 
 def load_npz_outputs(data_dir, array_keys, metadata_keys=()):
@@ -324,7 +326,7 @@ def plot_environment_summary(config):
     return fig
 
 
-def plot_all_environment_summaries(configs=ENVIRONMENTS):
+def plot_all_environment_summaries(configs):
     fig, axs = plt.subplots(
         len(configs),
         3,
@@ -363,7 +365,7 @@ def plot_innovation_decay_panel(config, ax, show_ylabel=False):
     sns.despine(ax=ax, left=True, bottom=True)
 
 
-def plot_all_innovation_decay(configs=ENVIRONMENTS):
+def plot_all_innovation_decay(configs):
     fig, axs = plt.subplots(1, len(configs), figsize=(12, 3), sharey=True)
     fig.suptitle(
         "Initial probability of attempting innovation under zero prestige gain",
@@ -380,10 +382,27 @@ def plot_all_innovation_decay(configs=ENVIRONMENTS):
 
 
 def main():
-    fig = plot_all_environment_summaries()
-    save_fig(fig, "experiment_1_combined")
-    fig = plot_all_innovation_decay()
-    save_fig(fig, "experiment_1_innovation_decay_combined")
+    if len(sys.argv) == 1:
+        print(
+            "Please specify the 'intrinsic' or 'gift' variant as a command-line argument."
+        )
+        return
+
+    variant = sys.argv[1]
+    if variant not in {"intrinsic", "gift"}:
+        print(f"Invalid variant {variant!r}. Must be 'intrinsic' or 'gift'.")
+        return
+
+    configs = []
+    for env_config in ENVIRONMENTS:
+        config_dict = env_config.__dict__.copy()
+        config_dict["data_dir"] = get_data_path(env_config, variant)
+        configs.append(EnvironmentConfig(**config_dict))
+
+    fig = plot_all_environment_summaries(configs)
+    save_fig(fig, f"experiment_1_combined_{variant}")
+    fig = plot_all_innovation_decay(configs)
+    save_fig(fig, f"experiment_1_innovation_decay_combined_{variant}")
 
 
 if __name__ == "__main__":

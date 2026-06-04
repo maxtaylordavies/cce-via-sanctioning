@@ -2,7 +2,7 @@ import jax
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
 
-from experiment_1.notebook import (
+from recipe_world_env.experiment_1.notebook_intrinsic import (
     PAD,
     N,
     H,

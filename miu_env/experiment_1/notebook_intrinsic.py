@@ -362,8 +362,8 @@ def run_simulation_loop(
 
 def main():
     seeds = list(range(5))
-    grid_length, n_arms, T = 10, 200, int(2e3)
-    prestige_gain_vals = jnp.linspace(0.0, 10.0, 21)
+    grid_length, n_arms, T = 10, 200, int(1e3)
+    prestige_gain_vals = 10 * jnp.linspace(0.0, 1.0, 21)
     prestige_decay = 0.01
     prestige_value = 1.0
 
