@@ -202,15 +202,7 @@ def update_arm_knowledge(
     new_levels, new_payoffs, innovated, imitated = jax.vmap(per_agent)(
         keys, jnp.arange(all_agent_arm_levels.shape[0])
     )
-    return new_levels, new_payoffs, innovated.sum(), imitated.sum()
-
-
-@jax.jit
-def compute_role_costs_and_benefits(roles, innov_cost, imit_fee):
-    n_innov = (roles == ROLE_INNOVATE).sum()
-    n_imit = (roles == ROLE_IMITATE).sum()
-    subsidy = (imit_fee * n_imit) / (jnp.maximum(n_innov, 1))  # avoid division by zero
-    return jnp.where(roles == ROLE_INNOVATE, subsidy - innov_cost, -imit_fee)
+    return new_levels, new_payoffs, innovated, imitated
 
 
 @partial(jax.jit, static_argnames=("n_arms",))
@@ -228,7 +220,7 @@ def run_simulation_loop(
     grid_length,
     n_arms,
     T,
-    imit_fee=0.0,
+    prestige_gain,
     innov_cost=2.0,
     p_death=0.001,
     p_change=0.01,
@@ -236,6 +228,8 @@ def run_simulation_loop(
     imit_dist_threshold=1,
     learning_rate=0.1,
     init_q=1.0,
+    prestige_decay=0.01,
+    prestige_value=1.0,
 ):
     n_agents = grid_length**2
 
@@ -253,13 +247,20 @@ def run_simulation_loop(
     torus_col_dists = jnp.minimum(col_diffs, grid_length - col_diffs)
     agent_dists = torus_row_dists + torus_col_dists
     neighbours_mask = ((agent_dists > 0) & (agent_dists <= imit_dist_threshold)).astype(
-        jnp.bool
+        jnp.bool_
     )
 
     vmapped_exploit = jax.vmap(exploit, in_axes=(0, 0, None))
 
     def body_fn(carry, t):
-        key, full_rewards, agent_arm_levels, agent_arm_payoff_estimates, q_vals = carry
+        (
+            key,
+            full_rewards,
+            agent_arm_levels,
+            agent_arm_payoff_estimates,
+            q_vals,
+            prestiges,
+        ) = carry
 
         # get new keys
         key, change_key, death_key, role_key, update_key = jax.random.split(key, 5)
@@ -277,6 +278,8 @@ def run_simulation_loop(
         agent_arm_payoff_estimates = jnp.where(
             deaths[:, None], 0.0, agent_arm_payoff_estimates
         )
+        prestiges = jnp.where(deaths, 0.0, prestiges)
+        prestiges = prestiges * (1.0 - prestige_decay)
 
         # compute payoffs from exploiting current knowledge
         curr_payoffs, agent_arm_payoff_estimates = vmapped_exploit(
@@ -288,7 +291,7 @@ def run_simulation_loop(
         roles = jax.random.categorical(role_key, jnp.log(role_probs), axis=1)
 
         # update knowledge based on roles and compute new prospective payoffs
-        new_agent_arm_levels, new_agent_arm_payoff_estimates, n_innov, n_imit = (
+        new_agent_arm_levels, new_agent_arm_payoff_estimates, innovated, imitated = (
             update_arm_knowledge(
                 update_key,
                 agent_arm_levels,
@@ -301,10 +304,13 @@ def run_simulation_loop(
         new_payoffs, _ = vmapped_exploit(
             new_agent_arm_levels, new_agent_arm_payoff_estimates, full_rewards
         )
+        prestige_changes = prestige_gain * innovated.astype(jnp.float32)
+        new_prestiges = prestiges + prestige_changes
 
         # compute role rewards and costs
         rewards = new_payoffs - curr_payoffs
-        rewards += compute_role_costs_and_benefits(roles, innov_cost, imit_fee)
+        rewards -= jnp.where(roles == ROLE_INNOVATE, innov_cost, 0.0)
+        rewards += prestige_value * prestige_changes
 
         # update q-values
         rpe = rewards - q_vals[jnp.arange(n_agents), roles]
@@ -315,6 +321,8 @@ def run_simulation_loop(
         mean_avg_level = agent_arm_levels.mean()
         mean_max_level = agent_arm_levels.max(axis=1).mean()
         mean_role_probs = role_probs.mean(axis=0)
+        mean_prestige = new_prestiges.mean()
+        max_prestige = new_prestiges.max()
 
         return (
             key,
@@ -322,13 +330,17 @@ def run_simulation_loop(
             new_agent_arm_levels,
             new_agent_arm_payoff_estimates,
             new_all_q_vals,
+            new_prestiges,
         ), (
             mean_payoff,
             mean_avg_level,
             mean_max_level,
-            n_innov,
-            n_imit,
+            innovated.sum(),
+            imitated.sum(),
             mean_role_probs,
+            roles,
+            mean_prestige,
+            max_prestige,
         )
 
     full_rewards = sample_arm_rewards(key, n_arms)
@@ -338,6 +350,7 @@ def run_simulation_loop(
         jnp.zeros((n_agents, n_arms), dtype=jnp.int32),  # agent_arm_levels
         jnp.zeros((n_agents, n_arms), dtype=jnp.float32),  # agent_arm_payoff_estimates
         jnp.full((n_agents, 2), init_q, dtype=jnp.float32),  # q_vals
+        jnp.zeros((n_agents,), dtype=jnp.float32),  # prestiges
     )
 
     _, metrics = jax.lax.scan(body_fn, carry, jnp.arange(T))
@@ -348,54 +361,84 @@ def run_simulation_loop(
     return metrics
 
 
-seeds = [0, 1, 2]
-grid_length, n_arms, T = 10, 200, int(2e3)
-fees = jnp.linspace(-2.0, 2.0, 11)
+def main():
+    seeds = list(range(10))
+    grid_length, n_arms, T = 10, 200, int(1e3)
+    prestige_gain_vals = 7 * jnp.linspace(0.0, 1.0, 30)
+    prestige_decay = 0.01
+    prestige_value = 1.0
+
+    def run_with_prestige_gain(key, prestige_gain):
+        return jax.block_until_ready(
+            run_simulation_loop(
+                key,
+                grid_length,
+                n_arms,
+                T,
+                prestige_gain=prestige_gain,
+                prestige_decay=prestige_decay,
+                prestige_value=prestige_value,
+            )
+        )
+
+    all_prop_payoffs = []
+    all_mean_avg_levels = []
+    all_mean_max_levels = []
+    all_n_innovs = []
+    all_n_imits = []
+    all_mean_role_probs = []
+    all_agent_roles = []
+    all_mean_prestige = []
+    all_max_prestige = []
+
+    for seed in tqdm(seeds):
+        key = jax.random.PRNGKey(seed)
+        (
+            prop_payoffs,
+            mean_avg_levels,
+            mean_max_levels,
+            n_innovs,
+            n_imits,
+            mean_role_probs,
+            agent_roles,
+            mean_prestige,
+            max_prestige,
+        ) = jax.vmap(run_with_prestige_gain, in_axes=(None, 0))(key, prestige_gain_vals)
+
+        all_prop_payoffs.append(np.asarray(prop_payoffs))
+        all_mean_avg_levels.append(np.asarray(mean_avg_levels))
+        all_mean_max_levels.append(np.asarray(mean_max_levels))
+        all_n_innovs.append(np.asarray(n_innovs))
+        all_n_imits.append(np.asarray(n_imits))
+        all_mean_role_probs.append(np.asarray(mean_role_probs))
+        all_agent_roles.append(np.asarray(agent_roles))
+        all_mean_prestige.append(np.asarray(mean_prestige))
+        all_max_prestige.append(np.asarray(max_prestige))
+
+    simulation_outputs = {
+        "fees": np.asarray(prestige_gain_vals),
+        "prestige_gains": np.asarray(prestige_gain_vals),
+        "seeds": np.asarray(seeds),
+        "T": np.int32(T),
+        "grid_length": np.int32(grid_length),
+        "n_arms": np.int32(n_arms),
+        "prestige_decay": np.float32(prestige_decay),
+        "prestige_value": np.float32(prestige_value),
+        "role_innovate": np.int32(ROLE_INNOVATE),
+        "role_imitate": np.int32(ROLE_IMITATE),
+        "payoffs": np.stack(all_prop_payoffs, axis=0),
+        "avg_levels": np.stack(all_mean_avg_levels, axis=0),
+        "max_levels": np.stack(all_mean_max_levels, axis=0),
+        "n_innov": np.stack(all_n_innovs, axis=0),
+        "n_imit": np.stack(all_n_imits, axis=0),
+        "role_probs": np.stack(all_mean_role_probs, axis=0),
+        "agent_roles": np.stack(all_agent_roles, axis=0),
+        "mean_prestige": np.stack(all_mean_prestige, axis=0),
+        "max_prestige": np.stack(all_max_prestige, axis=0),
+    }
+
+    np.savez(f"simulation_outputs_{seeds[0]}-{seeds[-1]}.npz", **simulation_outputs)
 
 
-def run_with_fee(key, fee):
-    return jax.block_until_ready(
-        run_simulation_loop(key, grid_length, n_arms, T, imit_fee=fee)
-    )
-
-
-all_prop_payoffs = []
-all_mean_avg_levels = []
-all_mean_max_levels = []
-all_n_innovs = []
-all_n_imits = []
-all_mean_role_probs = []
-
-for seed in tqdm(seeds):
-    key = jax.random.PRNGKey(seed)
-    (
-        prop_payoffs,
-        mean_avg_levels,
-        mean_max_levels,
-        n_innovs,
-        n_imits,
-        mean_role_probs,
-    ) = jax.vmap(run_with_fee, in_axes=(None, 0))(key, fees)
-
-    all_prop_payoffs.append(np.asarray(prop_payoffs))
-    all_mean_avg_levels.append(np.asarray(mean_avg_levels))
-    all_mean_max_levels.append(np.asarray(mean_max_levels))
-    all_n_innovs.append(np.asarray(n_innovs))
-    all_n_imits.append(np.asarray(n_imits))
-    all_mean_role_probs.append(np.asarray(mean_role_probs))
-
-simulation_outputs = {
-    "fees": np.asarray(fees),
-    "seeds": np.asarray(seeds),
-    "T": np.int32(T),
-    "grid_length": np.int32(grid_length),
-    "role_innovate": np.int32(ROLE_INNOVATE),
-    "role_imitate": np.int32(ROLE_IMITATE),
-    "payoffs": np.stack(all_prop_payoffs, axis=0),
-    "avg_levels": np.stack(all_mean_avg_levels, axis=0),
-    "max_levels": np.stack(all_mean_max_levels, axis=0),
-    "n_innov": np.stack(all_n_innovs, axis=0),
-    "n_imit": np.stack(all_n_imits, axis=0),
-}
-
-np.savez(f"simulation_outputs_{seeds[0]}-{seeds[-1]}.npz", **simulation_outputs)
+if __name__ == "__main__":
+    main()

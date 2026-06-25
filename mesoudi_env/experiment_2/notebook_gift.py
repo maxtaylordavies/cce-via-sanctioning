@@ -24,29 +24,78 @@ def innovate(key, traits, curr_L, p_i):
     return traits.at[idx].set(new_val), success.astype(int)
 
 
-# @jax.jit
-# def imitate(key, all_traits, can_imitate, agent_idx, curr_L):
-#     demonstrator_key, trait_key = jax.random.split(key)
-#     p_demonstrator = can_imitate[agent_idx] / can_imitate[agent_idx].sum()
-#     demonstrator_idx = jax.random.choice(
-#         demonstrator_key, all_traits.shape[0], p=p_demonstrator
-#     )
-#     trait_idx = jax.random.randint(trait_key, (), 0, curr_L)
-#     curr_val = all_traits[agent_idx, trait_idx]
-#     new_val = all_traits[demonstrator_idx, trait_idx]
-#     return all_traits[agent_idx].at[trait_idx].set(curr_val | new_val)
+@jax.jit
+def choose_demonstrator(
+    key,
+    candidate_mask,
+    all_prestiges,
+    agent_idx,
+    prestige_bias,
+    demonstrator_prestige_baseline,
+):
+    prestige_scores = (
+        demonstrator_prestige_baseline + jnp.maximum(all_prestiges, 0.0)
+    ) ** prestige_bias
+    weights = jnp.where(candidate_mask, prestige_scores, 0.0)
+
+    fallback_mask = jnp.arange(all_prestiges.shape[0]) != agent_idx
+    fallback_weights = jnp.where(fallback_mask, 1.0, 0.0)
+    weights = jnp.where(weights.sum() > 0, weights, fallback_weights)
+    logits = jnp.where(weights > 0, jnp.log(weights), -jnp.inf)
+    return jax.random.categorical(key, logits)
 
 
 @jax.jit
-def imitate(key, all_traits, can_imitate, agent_idx, p_c):
-    # trait_mask = jax.random.bernoulli(key, p_c, shape=all_traits.shape)
-    # trait_mask = jnp.ones_like(all_traits, dtype=jnp.bool)
-    # copy_mask = can_imitate[agent_idx].reshape(-1, 1) & trait_mask
-    # copied_traits = (all_traits * copy_mask).sum(axis=0) > 0
-    copied_traits = (all_traits * can_imitate.reshape(-1, 1)).sum(axis=0) > 0
+def compute_gift(
+    demonstrator_prestige,
+    gift_rate,
+    gift_base,
+    gift_exponent,
+    gift_cap,
+):
+    raw_gift = gift_base + gift_rate * (
+        jnp.maximum(demonstrator_prestige, 0.0) ** gift_exponent
+    )
+    return jnp.minimum(raw_gift, gift_cap)
+
+
+@jax.jit
+def imitate(
+    key,
+    all_traits,
+    all_prestiges,
+    can_imitate,
+    agent_idx,
+    p_c,
+    prestige_bias,
+    demonstrator_prestige_baseline,
+    gift_rate,
+    gift_base,
+    gift_exponent,
+    gift_cap,
+):
+    demonstrator_key, copy_key = jax.random.split(key)
+    demonstrator_idx = choose_demonstrator(
+        demonstrator_key,
+        can_imitate,
+        all_prestiges,
+        agent_idx,
+        prestige_bias,
+        demonstrator_prestige_baseline,
+    )
+    copied_traits = all_traits[demonstrator_idx] & jax.random.bernoulli(
+        copy_key, p_c, shape=all_traits.shape[1:]
+    )
     new = all_traits[agent_idx] | copied_traits
     n_changed = (new & ~all_traits[agent_idx]).sum()
-    return new, n_changed
+    gift = compute_gift(
+        all_prestiges[demonstrator_idx],
+        gift_rate,
+        gift_base,
+        gift_exponent,
+        gift_cap,
+    )
+    return new, n_changed, demonstrator_idx, gift
 
 
 @partial(jax.jit, static_argnames=("grid_length", "T"))
@@ -56,7 +105,7 @@ def run_simulation_loop(
     T,
     run_cgs=True,
     disconnect_group_traits=False,
-    run_cgs_every=100,
+    run_cgs_every=200,
     cgs_mut_std=0.05,
     max_n_groups=9,
     tournament_size=3,
@@ -68,7 +117,15 @@ def run_simulation_loop(
     init_q=1.0,
     choice_beta=0.1,
     learning_rate=0.1,
-    imit_dist_threshold=1,
+    imit_dist_threshold=100,
+    prestige_decay=0.01,
+    prestige_value=0.0,
+    prestige_bias=1.0,
+    demonstrator_prestige_baseline=1.0,
+    gift_rate=0.01,
+    gift_base=0.0,
+    gift_exponent=1.0,
+    gift_cap=jnp.inf,
 ):
     # In the top-down regime, every group-selection event replaces all 9 groups
     # with fresh descendants, so we budget for one initial cohort plus at most T
@@ -91,7 +148,7 @@ def run_simulation_loop(
     torus_col_dists = jnp.minimum(col_diffs, grid_length - col_diffs)
     agent_dists = torus_row_dists + torus_col_dists
     neighbours_mask = ((agent_dists > 0) & (agent_dists <= imit_dist_threshold)).astype(
-        jnp.bool
+        jnp.bool_
     )
 
     # initialise group tiling
@@ -151,6 +208,7 @@ def run_simulation_loop(
         next_group_norm_vals = winner_norm_vals + (
             jax.random.normal(mut_key, shape=(max_n_groups,)) * cgs_mut_std
         )
+        # next_group_norm_vals = jnp.maximum(next_group_norm_vals, 0.0)
         new_group_instance_ids_by_label = next_group_instance_id + jnp.arange(
             max_n_groups, dtype=jnp.int32
         )
@@ -169,7 +227,7 @@ def run_simulation_loop(
             next_group_birth_timesteps,
         )
 
-    def _apply_group_fee_change_to_q_vals(
+    def _apply_group_prestige_gain_change_to_q_vals(
         q_vals,
         old_grid,
         old_group_norm_vals,
@@ -178,20 +236,23 @@ def run_simulation_loop(
         new_group_norm_vals,
         new_group_instance_ids_by_label,
     ):
-        # When an agent moves to a group with a different fee norm, immediately
-        # nudge their role preferences toward the newly incentivised behaviour.
         old_group_labels = old_grid.reshape(-1)
         new_group_labels = new_grid.reshape(-1)
         old_group_instances = old_group_instance_ids_by_label[old_group_labels]
         new_group_instances = new_group_instance_ids_by_label[new_group_labels]
         group_changed = old_group_instances != new_group_instances
-        delta_fee = (
+        delta_prestige_gain = (
             new_group_norm_vals[new_group_labels]
             - old_group_norm_vals[old_group_labels]
         )
-        q_delta = jnp.where(group_changed, delta_fee, 0.0)
+
+        q_delta = jnp.where(
+            group_changed,
+            delta_prestige_gain,
+            0.0,
+        )
+        q_delta = jnp.where(disconnect_group_traits, 0.0, q_delta)
         new_q_vals = q_vals.at[:, ROLE_INNOVATE].add(q_delta)
-        new_q_vals = new_q_vals.at[:, ROLE_IMITATE].add(-q_delta)
         return jnp.where(disconnect_group_traits, q_vals, new_q_vals)
 
     @jax.jit
@@ -203,7 +264,14 @@ def run_simulation_loop(
         return (group_labels_grid == group).reshape(-1) & neighbours_mask[agent_idx]
 
     @jax.jit
-    def update_traits(key, all_traits, all_roles, group_labels_grid, curr_Ls):
+    def update_traits_and_gifts(
+        key,
+        all_traits,
+        all_prestiges,
+        all_roles,
+        group_labels_grid,
+        curr_Ls,
+    ):
         group_labels_1d = group_labels_grid.reshape(-1)
 
         def per_agent(key_, agent_idx):
@@ -213,14 +281,31 @@ def run_simulation_loop(
                 new_traits, success = innovate(
                     key_, all_traits[agent_idx], curr_Ls[group_idx], p_i
                 )
-                return new_traits, success, 0  # traits, # innovated, # imitated
+                return (
+                    new_traits,
+                    success,
+                    0,
+                    agent_idx,
+                    jnp.asarray(0.0, dtype=jnp.float32),
+                )
 
             def do_imitate(_):
                 imit_mask = can_imitate(agent_idx, group_labels_grid)
-                new_traits, n_copied = imitate(
-                    key_, all_traits, imit_mask, agent_idx, p_c
+                new_traits, n_copied, demonstrator_idx, gift = imitate(
+                    key_,
+                    all_traits,
+                    all_prestiges,
+                    imit_mask,
+                    agent_idx,
+                    p_c,
+                    prestige_bias,
+                    demonstrator_prestige_baseline,
+                    gift_rate,
+                    gift_base,
+                    gift_exponent,
+                    gift_cap,
                 )
-                return new_traits, 0, n_copied  # traits, # innovated, # imitated
+                return new_traits, 0, n_copied, demonstrator_idx, gift
 
             return jax.lax.cond(
                 all_roles[agent_idx] == ROLE_INNOVATE,
@@ -232,35 +317,13 @@ def run_simulation_loop(
         keys = jax.random.split(key, all_traits.shape[0])
         return jax.vmap(per_agent)(keys, jnp.arange(all_traits.shape[0]))
 
-    @jax.jit
-    def compute_role_costs_and_benefits(
-        all_roles, innov_cost, group_labels_grid, group_norm_values
-    ):
-        group_labels_1d = group_labels_grid.reshape(-1)
-
-        def per_group(group_idx):
-            group_mask = group_labels_1d == group_idx
-            innovators_in_group = (all_roles == ROLE_INNOVATE) & group_mask
-            imitators_in_group = (all_roles == ROLE_IMITATE) & group_mask
-            n_innov = (innovators_in_group).sum()
-            n_imit = (imitators_in_group).sum()
-            subsidy = (group_norm_values[group_idx] * n_imit) / jnp.maximum(n_innov, 1)
-            return jnp.where(
-                innovators_in_group,
-                subsidy - innov_cost,
-                jnp.where(imitators_in_group, -group_norm_values[group_idx], 0.0),
-            )
-
-        benefits = jax.vmap(per_group)(jnp.arange(max_n_groups)).sum(axis=0)
-        innov_cost_only = jnp.where(all_roles == ROLE_INNOVATE, -innov_cost, 0.0)
-        return jnp.where(disconnect_group_traits, innov_cost_only, benefits)
-
     def body_fn(carry, t):
         (
             key,
             curr_Ls,
             all_traits,
             all_q_vals,
+            all_prestiges,
             group_norm_values,
             group_labels_grid,
             group_instance_ids_by_label,
@@ -277,49 +340,73 @@ def run_simulation_loop(
         deaths = jax.random.bernoulli(death_key, p_d, shape=(N,))
         all_traits = jnp.where(deaths[:, None], 0, all_traits)
         all_q_vals = jnp.where(deaths[:, None], init_q, all_q_vals)
+        all_prestiges = jnp.where(deaths, 0, all_prestiges)
+        all_prestiges = all_prestiges * (1.0 - prestige_decay)
         traits_gained_since_cgs = jnp.where(deaths, 0.0, traits_gained_since_cgs)
 
         # agents select roles
         role_probs = jax.nn.softmax(all_q_vals / choice_beta, axis=1)
         all_roles = jax.random.categorical(role_key, jnp.log(role_probs), axis=1)
 
-        # compute current payoffs
+        # compute current material payoffs
         curr_trait_payoffs = compute_trait_payoffs(all_traits, b)
 
-        # update traits and compute new payoffs
-        new_all_traits, n_innovated, n_imitated = update_traits(
-            update_key, all_traits, all_roles, group_labels_grid, curr_Ls
+        # update traits, prestige, and deference transfers
+        (
+            new_all_traits,
+            n_innovated,
+            n_imitated,
+            demonstrator_idxs,
+            gifts_paid,
+        ) = update_traits_and_gifts(
+            update_key,
+            all_traits,
+            all_prestiges,
+            all_roles,
+            group_labels_grid,
+            curr_Ls,
         )
+        group_labels_1d = group_labels_grid.reshape(-1)
+        prestige_gain_by_agent = group_norm_values[group_labels_1d]
+        prestige_gain_by_agent = jnp.where(
+            disconnect_group_traits, 0.0, prestige_gain_by_agent
+        )
+        prestige_changes = prestige_gain_by_agent * n_innovated.astype(jnp.float32)
+        new_all_prestiges = all_prestiges + prestige_changes
         new_trait_payoffs = compute_trait_payoffs(new_all_traits, b)
         updated_traits_gained_since_cgs = traits_gained_since_cgs + (
             n_innovated + n_imitated
         ).astype(jnp.float32)
 
-        # compute role rewards and costs
-        rewards = new_trait_payoffs - curr_trait_payoffs
-        rewards += compute_role_costs_and_benefits(
-            all_roles, innov_cost, group_labels_grid, group_norm_values
+        incoming_gifts = (
+            jnp.zeros((N,), dtype=jnp.float32).at[demonstrator_idxs].add(gifts_paid)
         )
 
-        # update q vals
-        rpe = rewards - all_q_vals[jnp.arange(N), all_roles]
+        direct_rewards = new_trait_payoffs - curr_trait_payoffs
+        direct_rewards -= gifts_paid
+        direct_rewards -= jnp.where(all_roles == ROLE_INNOVATE, innov_cost, 0.0)
+        direct_rewards += prestige_value * prestige_changes
+
+        direct_rpe = direct_rewards - all_q_vals[jnp.arange(N), all_roles]
         new_all_q_vals = all_q_vals.at[jnp.arange(N), all_roles].add(
-            learning_rate * rpe
+            learning_rate * direct_rpe
+        )
+        gift_income_rpe = jnp.where(
+            incoming_gifts > 0.0,
+            incoming_gifts - new_all_q_vals[:, ROLE_INNOVATE],
+            0.0,
+        )
+        new_all_q_vals = new_all_q_vals.at[:, ROLE_INNOVATE].add(
+            learning_rate * gift_income_rpe
         )
 
         # compute some metrics for logging
-        total_unique_traits_known = (all_traits.sum(axis=0) > 0).sum()
-        per_agent_traits_known = all_traits.sum(axis=1)
-        most_traits_known, mean_traits_known = (
-            per_agent_traits_known.max(),
-            per_agent_traits_known.mean(),
-        )
+        per_agent_traits_known = new_all_traits.sum(axis=1)
+        mean_traits_known = per_agent_traits_known.mean()
+        total_gifts_paid = gifts_paid.sum()
+        max_gift_income = incoming_gifts.max()
 
         # determine whether to unlock new space of traits
-        # mask = jnp.arange(MAX_TOTAL_L)
-        # mask = (mask >= curr_L - L) & (mask < curr_L)
-        # mean_prop_known = (all_traits * mask.reshape(1, -1)).sum(axis=1).mean() / L
-
         group_num_traits_known = _group_average_values(
             group_labels_grid, per_agent_traits_known
         )
@@ -355,13 +442,14 @@ def run_simulation_loop(
                 group_labels_grid,
                 group_norm_values,
                 group_trait_gain_scores,
+                # group_num_traits_known,
                 group_instance_ids_by_label,
                 next_group_instance_id,
                 group_parent_instance_ids,
                 group_birth_timesteps,
             ),
         )
-        new_all_q_vals = _apply_group_fee_change_to_q_vals(
+        new_all_q_vals = _apply_group_prestige_gain_change_to_q_vals(
             new_all_q_vals,
             old_group_labels_grid,
             old_group_norm_values,
@@ -381,6 +469,7 @@ def run_simulation_loop(
             new_Ls,
             new_all_traits,
             new_all_q_vals,
+            new_all_prestiges,
             group_norm_values,
             group_labels_grid,
             group_instance_ids_by_label,
@@ -393,12 +482,24 @@ def run_simulation_loop(
             group_norm_values,
             group_labels_grid,
             group_instance_ids_by_label,
+            role_probs.mean(axis=0),
+            all_roles,
+            n_innovated.sum(),
+            n_imitated.sum(),
+            new_all_prestiges.mean(),
+            new_all_prestiges.max(),
+            total_gifts_paid,
+            max_gift_income,
         )
 
     init_norm_key = jax.random.fold_in(key, 0)
     group_norm_values = (
         jax.random.normal(init_norm_key, shape=(max_n_groups,)) * cgs_mut_std
     )
+    # group_norm_values = jnp.maximum(
+    #     jax.random.normal(init_norm_key, shape=(max_n_groups,)) * cgs_mut_std,
+    #     0.0,
+    # )
     group_norm_values = jnp.where(
         run_cgs, group_norm_values, jnp.zeros_like(group_norm_values)
     )
@@ -416,6 +517,7 @@ def run_simulation_loop(
         jnp.full(max_n_groups, L, dtype=jnp.int32),  # curr_Ls
         jnp.zeros((N, MAX_TOTAL_L), dtype=jnp.int8),  # all_traits
         jnp.full((N, 2), init_q, dtype=jnp.float32),  # all_q_vals
+        jnp.zeros((N,), dtype=jnp.float32),  # all_prestiges
         group_norm_values,
         base_group_grid,
         group_instance_ids_by_label,
@@ -427,71 +529,147 @@ def run_simulation_loop(
 
     carry, metrics = jax.lax.scan(body_fn, carry, jnp.arange(T))
 
-    return (*metrics, carry[7], carry[8], carry[9])
+    metrics = list(metrics)
+    metrics[6] = jnp.cumsum(metrics[6])  # cumulative number innovated
+    metrics[7] = jnp.cumsum(metrics[7])  # cumulative number imitated
+    metrics[10] = jnp.cumsum(metrics[10])  # cumulative gift transfers
+    return (*metrics, carry[8], carry[9], carry[10])
 
 
-seeds = list(range(5))
-grid_length, T = 30, int(2.5e3)
+def main():
+    seeds = list(range(10))
+    grid_length, T = 30, int(1e4)
+    run_cgs_every = 100
+    cgs_mut_std = 0.1
+    prestige_decay = 0.01
+    prestige_value = 0.0
+    prestige_bias = 1.0
+    demonstrator_prestige_baseline = 1.0
+    gift_rate = 0.01
+    gift_base = 0.0
+    gift_exponent = 1.0
+    gift_cap = np.float32(np.inf)
 
-all_mean_traits_known = []
-all_group_norm_values = []
-all_group_labels_grids = []
-all_group_instance_ids_by_label_history = []
-all_group_lineage_arrays = []
-all_final_next_group_instance_ids = []
-for seed in tqdm(seeds):
-    key = jax.random.PRNGKey(seed)
+    all_mean_traits_known = []
+    all_group_norm_values = []
+    all_group_labels_grids = []
+    all_group_instance_ids_by_label_history = []
+    all_role_probs = []
+    all_agent_roles = []
+    all_n_innovated = []
+    all_n_imitated = []
+    all_mean_prestige = []
+    all_max_prestige = []
+    all_total_gifts = []
+    all_max_gift_income = []
+    all_group_lineage_arrays = []
+    all_final_next_group_instance_ids = []
+    for seed in tqdm(seeds):
+        key = jax.random.PRNGKey(seed)
 
-    (
-        mean_traits_known,
-        group_norm_values,
-        group_labels_grid,
-        group_instance_ids_by_label_history,
-        final_next_group_instance_id,
-        final_group_parent_instance_ids,
-        final_group_birth_timesteps,
-    ) = jax.block_until_ready(
-        run_simulation_loop(
-            key,
-            grid_length,
-            T,
-            run_cgs=True,
-            disconnect_group_traits=False,
+        (
+            mean_traits_known,
+            group_norm_values,
+            group_labels_grid,
+            group_instance_ids_by_label_history,
+            role_probs,
+            agent_roles,
+            n_innovated,
+            n_imitated,
+            mean_prestige,
+            max_prestige,
+            total_gifts,
+            max_gift_income,
+            final_next_group_instance_id,
+            final_group_parent_instance_ids,
+            final_group_birth_timesteps,
+        ) = jax.block_until_ready(
+            run_simulation_loop(
+                key,
+                grid_length,
+                T,
+                run_cgs=True,
+                disconnect_group_traits=False,
+                run_cgs_every=run_cgs_every,
+                cgs_mut_std=cgs_mut_std,
+                prestige_decay=prestige_decay,
+                prestige_value=prestige_value,
+                prestige_bias=prestige_bias,
+                demonstrator_prestige_baseline=demonstrator_prestige_baseline,
+                gift_rate=gift_rate,
+                gift_base=gift_base,
+                gift_exponent=gift_exponent,
+                gift_cap=gift_cap,
+            )
         )
-    )
 
-    all_mean_traits_known.append(np.asarray(mean_traits_known))
-    all_group_norm_values.append(np.asarray(group_norm_values))
-    all_group_labels_grids.append(np.asarray(group_labels_grid))
-    all_group_instance_ids_by_label_history.append(
-        np.asarray(group_instance_ids_by_label_history)
-    )
-    all_group_lineage_arrays.append(
-        np.stack(
-            [
-                np.asarray(final_group_parent_instance_ids),
-                np.asarray(final_group_birth_timesteps),
-            ],
-            axis=1,
+        all_mean_traits_known.append(np.asarray(mean_traits_known))
+        all_group_norm_values.append(np.asarray(group_norm_values))
+        all_group_labels_grids.append(np.asarray(group_labels_grid))
+        all_group_instance_ids_by_label_history.append(
+            np.asarray(group_instance_ids_by_label_history)
         )
-    )
-    all_final_next_group_instance_ids.append(np.asarray(final_next_group_instance_id))
+        all_role_probs.append(np.asarray(role_probs))
+        all_agent_roles.append(np.asarray(agent_roles))
+        all_n_innovated.append(np.asarray(n_innovated))
+        all_n_imitated.append(np.asarray(n_imitated))
+        all_mean_prestige.append(np.asarray(mean_prestige))
+        all_max_prestige.append(np.asarray(max_prestige))
+        all_total_gifts.append(np.asarray(total_gifts))
+        all_max_gift_income.append(np.asarray(max_gift_income))
+        all_group_lineage_arrays.append(
+            np.stack(
+                [
+                    np.asarray(final_group_parent_instance_ids),
+                    np.asarray(final_group_birth_timesteps),
+                ],
+                axis=1,
+            )
+        )
+        all_final_next_group_instance_ids.append(
+            np.asarray(final_next_group_instance_id)
+        )
 
-simulation_outputs = {
-    "seeds": np.asarray(seeds),
-    "T": np.int32(T),
-    "grid_length": np.int32(grid_length),
-    "role_innovate": np.int32(ROLE_INNOVATE),
-    "role_imitate": np.int32(ROLE_IMITATE),
-    "mean_traits_known": np.stack(all_mean_traits_known, axis=0),
-    "group_norm_values": np.stack(all_group_norm_values, axis=0),
-    "group_labels_grids": np.stack(all_group_labels_grids, axis=0),
-    "group_instance_ids_by_label_history": np.stack(
-        all_group_instance_ids_by_label_history, axis=0
-    ),
-    "group_lineage_arrays": np.stack(all_group_lineage_arrays, axis=0),
-    "final_next_group_instance_ids": np.stack(
-        all_final_next_group_instance_ids, axis=0
-    ),
-}
-np.savez(f"real_{seeds[0]}-{seeds[-1]}.npz", **simulation_outputs)
+    simulation_outputs = {
+        "seeds": np.asarray(seeds),
+        "T": np.int32(T),
+        "grid_length": np.int32(grid_length),
+        "max_total_l": np.int32(MAX_TOTAL_L),
+        "run_cgs_every": np.int32(run_cgs_every),
+        "cgs_mut_std": np.float32(cgs_mut_std),
+        "prestige_decay": np.float32(prestige_decay),
+        "prestige_value": np.float32(prestige_value),
+        "prestige_bias": np.float32(prestige_bias),
+        "demonstrator_prestige_baseline": np.float32(demonstrator_prestige_baseline),
+        "gift_rate": np.float32(gift_rate),
+        "gift_base": np.float32(gift_base),
+        "gift_exponent": np.float32(gift_exponent),
+        "gift_cap": np.float32(gift_cap),
+        "learning_rule": np.asarray("chosen_role_plus_gift_income_to_innovate"),
+        "group_norm_kind": np.asarray("prestige_gain"),
+        "role_innovate": np.int32(ROLE_INNOVATE),
+        "role_imitate": np.int32(ROLE_IMITATE),
+        "mean_traits_known": np.stack(all_mean_traits_known, axis=0),
+        "group_norm_values": np.stack(all_group_norm_values, axis=0),
+        "group_labels_grids": np.stack(all_group_labels_grids, axis=0),
+        "group_instance_ids_by_label_history": np.stack(
+            all_group_instance_ids_by_label_history, axis=0
+        ),
+        "role_probs": np.stack(all_role_probs, axis=0),
+        "agent_roles": np.stack(all_agent_roles, axis=0),
+        "n_innovated": np.stack(all_n_innovated, axis=0),
+        "n_imitated": np.stack(all_n_imitated, axis=0),
+        "mean_prestige": np.stack(all_mean_prestige, axis=0),
+        "max_prestige": np.stack(all_max_prestige, axis=0),
+        "total_gifts": np.stack(all_total_gifts, axis=0),
+        "max_gift_income": np.stack(all_max_gift_income, axis=0),
+        "group_lineage_arrays": np.stack(all_group_lineage_arrays, axis=0),
+        "final_next_group_instance_ids": np.stack(
+            all_final_next_group_instance_ids, axis=0
+        ),
+    }
+    np.savez(f"real_{seeds[0]}-{seeds[-1]}.npz", **simulation_outputs)
+
+
+if __name__ == "__main__":
+    main()
