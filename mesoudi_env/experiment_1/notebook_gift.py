@@ -161,7 +161,7 @@ def run_simulation_loop(
     p_i=1.0,
     p_c=1.0,
     b=0.2,
-    innov_cost=0.2,
+    innov_cost=0.1,
     p_d=0.001,
     init_q=1.0,
     choice_beta=0.1,
@@ -175,8 +175,6 @@ def run_simulation_loop(
     gift_base=0.0,
     gift_exponent=1.0,
     gift_cap=jnp.inf,
-    eligibility_trace_decay=0.5,
-    eligibility_discount=1.0,
 ):
     # Compute pairwise toroidal distances between agents for imitation.
     N = grid_length**2
@@ -197,7 +195,7 @@ def run_simulation_loop(
     )
 
     def body_fn(carry, t):
-        key, curr_L, all_traits, all_q_vals, all_prestiges, all_eligibilities = carry
+        key, curr_L, all_traits, all_q_vals, all_prestiges = carry
 
         # get new keys
         key, death_key, role_key, update_key = jax.random.split(key, 4)
@@ -207,7 +205,6 @@ def run_simulation_loop(
         all_traits = jnp.where(deaths[:, None], 0, all_traits)
         all_q_vals = jnp.where(deaths[:, None], init_q, all_q_vals)
         all_prestiges = jnp.where(deaths, 0, all_prestiges)
-        all_eligibilities = jnp.where(deaths[:, None], 0.0, all_eligibilities)
         all_prestiges = all_prestiges * (1.0 - prestige_decay)
 
         # agents select roles
@@ -247,23 +244,23 @@ def run_simulation_loop(
         incoming_gifts = (
             jnp.zeros((N,), dtype=jnp.float32).at[demonstrator_idxs].add(gifts_paid)
         )
-        transfer_rewards = incoming_gifts - gifts_paid
 
-        # compute role rewards and costs
-        rewards = new_trait_payoffs - curr_trait_payoffs
-        rewards += transfer_rewards
-        rewards -= jnp.where(all_roles == ROLE_INNOVATE, innov_cost, 0)
-        rewards += prestige_value * prestige_changes
+        direct_rewards = new_trait_payoffs - curr_trait_payoffs
+        direct_rewards -= gifts_paid
+        direct_rewards -= jnp.where(all_roles == ROLE_INNOVATE, innov_cost, 0)
+        direct_rewards += prestige_value * prestige_changes
 
-        # update q vals using an eligibility trace over recent role choices.
-        rpe = rewards - all_q_vals[jnp.arange(N), all_roles]
-        decayed_eligibilities = (
-            eligibility_discount * eligibility_trace_decay * all_eligibilities
+        direct_rpe = direct_rewards - all_q_vals[jnp.arange(N), all_roles]
+        new_all_q_vals = all_q_vals.at[jnp.arange(N), all_roles].add(
+            learning_rate * direct_rpe
         )
-        role_eligibilities = jax.nn.one_hot(all_roles, 2, dtype=all_eligibilities.dtype)
-        new_all_eligibilities = decayed_eligibilities + role_eligibilities
-        new_all_q_vals = all_q_vals + learning_rate * (
-            rpe[:, None] * new_all_eligibilities
+        gift_income_rpe = jnp.where(
+            incoming_gifts > 0.0,
+            incoming_gifts - new_all_q_vals[:, ROLE_INNOVATE],
+            0.0,
+        )
+        new_all_q_vals = new_all_q_vals.at[:, ROLE_INNOVATE].add(
+            learning_rate * gift_income_rpe
         )
 
         # compute some metrics for logging
@@ -284,12 +281,12 @@ def run_simulation_loop(
             new_all_traits,
             new_all_q_vals,
             new_all_prestiges,
-            new_all_eligibilities,
         ), (
             mean_traits_known,
             most_traits_known,
             total_unique_traits_known,
             role_probs.mean(axis=0),
+            all_roles,
             n_innovated.sum(),
             n_imitated.sum(),
             new_all_prestiges.mean(),
@@ -304,21 +301,20 @@ def run_simulation_loop(
         jnp.zeros((N, MAX_TOTAL_L), dtype=jnp.int8),  # all_traits
         jnp.full((N, 2), init_q, dtype=jnp.float32),  # all_q_vals
         jnp.zeros((N,), dtype=jnp.float32),  # all_prestiges
-        jnp.zeros((N, 2), dtype=jnp.float32),  # all_eligibilities
     )
 
     _, metrics = jax.lax.scan(body_fn, carry, jnp.arange(T))
     metrics = list(metrics)
-    metrics[4] = jnp.cumsum(metrics[4])  # cumulative number innovated
-    metrics[5] = jnp.cumsum(metrics[5])  # cumulative number imitated
-    metrics[8] = jnp.cumsum(metrics[8])  # cumulative gift transfers
+    metrics[5] = jnp.cumsum(metrics[5])  # cumulative number innovated
+    metrics[6] = jnp.cumsum(metrics[6])  # cumulative number imitated
+    metrics[9] = jnp.cumsum(metrics[9])  # cumulative gift transfers
     return metrics
 
 
 def main():
-    seeds = list(range(5))
+    seeds = list(range(10))
     grid_length, T = 10, int(4e3)
-    prestige_gain_vals = 10 * jnp.linspace(0.0, 1.0, 21)
+    prestige_gain_vals = 7 * jnp.linspace(0.0, 1.0, 30)
     prestige_decay = 0.01
     prestige_value = 0.0
     prestige_bias = 1.0
@@ -327,8 +323,6 @@ def main():
     gift_base = 0.0
     gift_exponent = 1.0
     gift_cap = np.float32(np.inf)
-    eligibility_trace_decay = 0.5
-    eligibility_discount = 1.0
 
     def run_with_prestige_gain(key, prestige_gain):
         return jax.block_until_ready(
@@ -345,8 +339,6 @@ def main():
                 gift_base=gift_base,
                 gift_exponent=gift_exponent,
                 gift_cap=gift_cap,
-                eligibility_trace_decay=eligibility_trace_decay,
-                eligibility_discount=eligibility_discount,
             )
         )
 
@@ -354,6 +346,7 @@ def main():
     all_most_traits = []
     all_total_unique_traits = []
     all_role_probs = []
+    all_agent_roles = []
     all_n_innovated = []
     all_n_imitated = []
     all_mean_prestige = []
@@ -368,6 +361,7 @@ def main():
             most_traits,
             total_unique_traits,
             role_probs,
+            agent_roles,
             n_innov,
             n_imit,
             mean_prestige,
@@ -380,6 +374,7 @@ def main():
         all_most_traits.append(np.asarray(most_traits))
         all_total_unique_traits.append(np.asarray(total_unique_traits))
         all_role_probs.append(np.asarray(role_probs))
+        all_agent_roles.append(np.asarray(agent_roles))
         all_n_innovated.append(np.asarray(n_innov))
         all_n_imitated.append(np.asarray(n_imit))
         all_mean_prestige.append(np.asarray(mean_prestige))
@@ -401,14 +396,14 @@ def main():
         "gift_base": np.float32(gift_base),
         "gift_exponent": np.float32(gift_exponent),
         "gift_cap": np.float32(gift_cap),
-        "eligibility_trace_decay": np.float32(eligibility_trace_decay),
-        "eligibility_discount": np.float32(eligibility_discount),
+        "learning_rule": np.asarray("chosen_role_plus_gift_income_to_innovate"),
         "role_innovate": np.int32(ROLE_INNOVATE),
         "role_imitate": np.int32(ROLE_IMITATE),
         "mean_traits": np.stack(all_mean_traits, axis=0),
         "most_traits": np.stack(all_most_traits, axis=0),
         "total_unique_traits": np.stack(all_total_unique_traits, axis=0),
         "role_probs": np.stack(all_role_probs, axis=0),
+        "agent_roles": np.stack(all_agent_roles, axis=0),
         "n_innovated": np.stack(all_n_innovated, axis=0),
         "n_imitated": np.stack(all_n_imitated, axis=0),
         "mean_prestige": np.stack(all_mean_prestige, axis=0),

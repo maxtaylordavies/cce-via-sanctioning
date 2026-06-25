@@ -338,6 +338,7 @@ def run_simulation_loop(
             innovated.sum(),
             imitated.sum(),
             mean_role_probs,
+            roles,
             mean_prestige,
             max_prestige,
         )
@@ -361,9 +362,9 @@ def run_simulation_loop(
 
 
 def main():
-    seeds = list(range(5))
+    seeds = list(range(10))
     grid_length, n_arms, T = 10, 200, int(1e3)
-    prestige_gain_vals = 10 * jnp.linspace(0.0, 1.0, 21)
+    prestige_gain_vals = 7 * jnp.linspace(0.0, 1.0, 30)
     prestige_decay = 0.01
     prestige_value = 1.0
 
@@ -386,6 +387,7 @@ def main():
     all_n_innovs = []
     all_n_imits = []
     all_mean_role_probs = []
+    all_agent_roles = []
     all_mean_prestige = []
     all_max_prestige = []
 
@@ -398,6 +400,7 @@ def main():
             n_innovs,
             n_imits,
             mean_role_probs,
+            agent_roles,
             mean_prestige,
             max_prestige,
         ) = jax.vmap(run_with_prestige_gain, in_axes=(None, 0))(key, prestige_gain_vals)
@@ -408,6 +411,7 @@ def main():
         all_n_innovs.append(np.asarray(n_innovs))
         all_n_imits.append(np.asarray(n_imits))
         all_mean_role_probs.append(np.asarray(mean_role_probs))
+        all_agent_roles.append(np.asarray(agent_roles))
         all_mean_prestige.append(np.asarray(mean_prestige))
         all_max_prestige.append(np.asarray(max_prestige))
 
@@ -428,6 +432,7 @@ def main():
         "n_innov": np.stack(all_n_innovs, axis=0),
         "n_imit": np.stack(all_n_imits, axis=0),
         "role_probs": np.stack(all_mean_role_probs, axis=0),
+        "agent_roles": np.stack(all_agent_roles, axis=0),
         "mean_prestige": np.stack(all_mean_prestige, axis=0),
         "max_prestige": np.stack(all_max_prestige, axis=0),
     }

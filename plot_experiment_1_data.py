@@ -1,8 +1,8 @@
 from dataclasses import dataclass
 from pathlib import Path
-import sys
 
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 import numpy as np
 import pandas as pd
 import seaborn as sns
@@ -12,6 +12,9 @@ from src.utils import save_fig
 sns.set_context("paper", font_scale=1.2)
 sns.set_style("whitegrid")
 
+TARGET_INNOVATOR_FREQUENCY = 0.5
+REFERENCE_GAINS_PATH = Path("figures/experiment_1_reference_gains.csv")
+
 
 @dataclass(frozen=True)
 class EnvironmentConfig:
@@ -19,40 +22,32 @@ class EnvironmentConfig:
     title: str
     score_key: str
     score_normalizer: float | str
-    role_source: str
     final_window: int | str = 500
-    role_window: int = 1000
-    sample_interval: int = 20
     data_dir: Path = Path("data")
 
 
 ENVIRONMENTS = (
     EnvironmentConfig(
         name="mesoudi_env",
-        title="Binary trait env",
+        title="Binary trait environment",
         score_key="mean_traits",
         score_normalizer="max_total_l",
-        role_source="role_probs",
-        final_window=500,
-        role_window=1000,
+        final_window=1000,
     ),
     EnvironmentConfig(
         name="miu_env",
-        title="Refinement bandit env",
+        title="Refinement bandit environment",
         score_key="payoffs",
         score_normalizer=1.0,
-        role_source="role_probs",
-        final_window=500,
-        role_window=1000,
+        final_window=100,
     ),
     EnvironmentConfig(
         name="recipe_world_env",
-        title="Recipe grammar env",
+        title="Recipe grammar environment",
         score_key="agent_yields",
         score_normalizer=10.0,
-        role_source="agent_roles",
-        final_window="T_extra",
-        role_window=1000,
+        final_window=100,
+        # final_window="T_extra",
     ),
 )
 
@@ -119,13 +114,36 @@ def get_prestige_gains(outputs):
 
 
 def load_environment_outputs(config, array_keys):
-    metadata_keys = {"role_innovate", "role_imitate"}
+    metadata_keys = {"T", "grid_length", "role_innovate", "role_imitate"}
     if isinstance(config.score_normalizer, str):
         metadata_keys.add(config.score_normalizer)
     if isinstance(config.final_window, str):
         metadata_keys.add(config.final_window)
 
     return load_npz_outputs(config.data_dir, array_keys, metadata_keys)
+
+
+def get_agent_roles(outputs):
+    roles = np.asarray(outputs["agent_roles"])
+
+    role_innovate = int(get_scalar(outputs, "role_innovate"))
+    role_imitate = int(get_scalar(outputs, "role_imitate"))
+    min_role = min(role_innovate, role_imitate)
+    max_role = max(role_innovate, role_imitate)
+
+    if roles.ndim != 4:
+        raise ValueError(
+            "Expected agent_roles to have shape (seed, prestige_gain, time, agent), "
+            f"but got {roles.shape}."
+        )
+
+    if roles.min() < min_role or roles.max() > max_role:
+        raise ValueError(
+            "agent_roles contains values outside the saved role codes: "
+            f"expected values between {min_role} and {max_role}."
+        )
+
+    return roles
 
 
 def get_score_ts(outputs, config):
@@ -145,28 +163,43 @@ def get_final_window(outputs, config):
     return int(config.final_window)
 
 
-def get_role_split_df(outputs, config, gains):
+def get_innovator_frequency_df(outputs, config, gains):
     role_innovate = int(get_scalar(outputs, "role_innovate"))
-    role_imitate = int(get_scalar(outputs, "role_imitate"))
+    roles = get_agent_roles(outputs)
+    innovate = (roles == role_innovate).mean(axis=(2, 3))
 
-    if config.role_source == "role_probs":
-        role_probs = np.asarray(outputs["role_probs"], dtype=np.float64)
-        role_window = role_probs[:, :, -config.role_window :, :]
-        innovate = role_window[..., role_innovate].mean(axis=(0, 2))
-        imitate = role_window[..., role_imitate].mean(axis=(0, 2))
-    else:
-        roles = np.asarray(outputs["agent_roles"])
-        role_window = roles[:, :, -config.role_window :, :]
-        innovate = (role_window == role_innovate).mean(axis=(0, 2, 3))
-        imitate = (role_window == role_imitate).mean(axis=(0, 2, 3))
+    rows = []
+    for seed_idx in range(innovate.shape[0]):
+        for gain_idx, gain in enumerate(gains):
+            rows.append(
+                {
+                    "seed": seed_idx,
+                    "prestige_gain": gain,
+                    "innovator_frequency": innovate[seed_idx, gain_idx],
+                }
+            )
+    return pd.DataFrame(rows)
 
-    return pd.DataFrame(
-        {
-            "prestige_gain": gains,
-            "innovate": innovate,
-            "imitate": imitate,
-        }
-    ).sort_values("prestige_gain")
+
+def get_any_innovation_attempt_df(outputs, config, gains):
+    role_innovate = int(get_scalar(outputs, "role_innovate"))
+    final_window = get_final_window(outputs, config)
+
+    roles = get_agent_roles(outputs)
+    any_innovation = (roles == role_innovate).any(axis=-1)
+    probabilities = any_innovation[:, :, -final_window:].mean(axis=2)
+
+    rows = []
+    for seed_idx in range(probabilities.shape[0]):
+        for gain_idx, gain in enumerate(gains):
+            rows.append(
+                {
+                    "seed": seed_idx,
+                    "prestige_gain": gain,
+                    "any_innovation_probability": probabilities[seed_idx, gain_idx],
+                }
+            )
+    return pd.DataFrame(rows)
 
 
 def get_final_score_df(score_ts, gains, final_window):
@@ -184,225 +217,224 @@ def get_final_score_df(score_ts, gains, final_window):
     return pd.DataFrame(rows)
 
 
-def get_peak_gain(final_score_df):
-    return (
-        final_score_df.groupby("prestige_gain")["score"]
+def get_reference_prestige_gain(innovator_frequency_df):
+    mean_frequencies = (
+        innovator_frequency_df.groupby("prestige_gain")["innovator_frequency"]
         .mean()
-        .sort_values(ascending=False)
-        .index[0]
+        .sort_index()
     )
+    gains = mean_frequencies.index.to_numpy(dtype=float)
+    frequencies = mean_frequencies.to_numpy(dtype=float)
+    crossing_idxs = np.flatnonzero(frequencies >= TARGET_INNOVATOR_FREQUENCY)
 
+    if crossing_idxs.size == 0:
+        raise ValueError(
+            f"Innovator frequency never reaches {TARGET_INNOVATOR_FREQUENCY}"
+        )
 
-def get_timeseries_df(score_ts, gains, peak_gain, sample_interval):
-    baseline_idx = int(np.argmin(np.abs(gains - 0.0)))
-    peak_idx = int(np.argmin(np.abs(gains - peak_gain)))
-    selected = {
-        baseline_idx: "baseline",
-        peak_idx: f"peak ({gains[peak_idx]:g})",
-    }
+    upper_idx = int(crossing_idxs[0])
+    if upper_idx == 0:
+        return gains[0]
 
-    rows = []
-    for gain_idx, condition in selected.items():
-        for seed_idx in range(score_ts.shape[0]):
-            for t in range(0, score_ts.shape[2], sample_interval):
-                rows.append(
-                    {
-                        "seed": seed_idx,
-                        "t": t,
-                        "score": score_ts[seed_idx, gain_idx, t],
-                        "condition": condition,
-                    }
-                )
-    return pd.DataFrame(rows)
+    lower_idx = upper_idx - 1
+    frequency_span = frequencies[upper_idx] - frequencies[lower_idx]
+    if np.isclose(frequency_span, 0):
+        return gains[upper_idx]
 
-
-def get_zero_p_innovate_ts(outputs, config):
-    gains = get_prestige_gains(outputs)
-    zero_idx = int(np.argmin(np.abs(gains - 0.0)))
-    role_innovate = int(get_scalar(outputs, "role_innovate"))
-
-    if config.role_source == "role_probs":
-        return np.asarray(outputs["role_probs"])[:, zero_idx, :, role_innovate]
-
-    agent_roles = np.asarray(outputs["agent_roles"])[:, zero_idx]
-    return (agent_roles == role_innovate).mean(axis=2)
+    crossing_fraction = (
+        TARGET_INNOVATOR_FREQUENCY - frequencies[lower_idx]
+    ) / frequency_span
+    return gains[lower_idx] + crossing_fraction * (gains[upper_idx] - gains[lower_idx])
 
 
 def get_environment_summary_data(config):
-    outputs = load_environment_outputs(config, {config.score_key, config.role_source})
+    outputs = load_environment_outputs(config, {config.score_key, "agent_roles"})
     gains = get_prestige_gains(outputs)
     score_ts = get_score_ts(outputs, config)
     final_window = get_final_window(outputs, config)
 
     final_score_df = get_final_score_df(score_ts, gains, final_window)
-    peak_gain = float(get_peak_gain(final_score_df))
-    role_split_df = get_role_split_df(outputs, config, gains)
-    ts_df = get_timeseries_df(score_ts, gains, peak_gain, config.sample_interval)
+    innovator_frequency_df = get_innovator_frequency_df(outputs, config, gains)
+    any_innovation_attempt_df = get_any_innovation_attempt_df(outputs, config, gains)
 
-    return gains, final_score_df, peak_gain, role_split_df, ts_df
-
-
-def plot_environment_row(config, axs, show_column_titles=False, show_xlabels=False):
-    gains, final_score_df, peak_gain, role_split_df, ts_df = (
-        get_environment_summary_data(config)
+    return (
+        gains,
+        final_score_df,
+        innovator_frequency_df,
+        any_innovation_attempt_df,
     )
 
-    panel_titles = (
-        "Score over time (proportion of max possible)",
-        "Final score as a function of prestige gain",
-        "Time-averaged role frequencies",
-    )
 
-    axs[0].text(
-        -0.24,
-        0.5,
-        config.title,
-        transform=axs[0].transAxes,
-        rotation=90,
-        va="center",
-        ha="right",
-        fontsize=13,
-        fontweight="bold",
+def plot_environment_panel(
+    config,
+    ax,
+    show_title=False,
+    show_xlabel=False,
+    show_yticks=False,
+    show_any_innovation_attempt=False,
+):
+    (
+        gains,
+        final_score_df,
+        innovator_frequency_df,
+        any_innovation_attempt_df,
+    ) = get_environment_summary_data(config)
+    reference_gain = get_reference_prestige_gain(innovator_frequency_df)
+    final_score_df = final_score_df.assign(
+        normalized_gain=final_score_df["prestige_gain"] / reference_gain
     )
-    sns.lineplot(
-        ts_df,
-        x="t",
-        y="score",
-        hue="condition",
-        ax=axs[0],
-        palette=["xkcd:periwinkle", "xkcd:turquoise"],
-        legend=False,
-        linewidth=2.0,
+    innovator_frequency_df = innovator_frequency_df.assign(
+        normalized_gain=innovator_frequency_df["prestige_gain"] / reference_gain
     )
-    axs[0].set(
-        title=panel_titles[0] if show_column_titles else None,
-        xlabel="$t$" if show_xlabels else None,
-        ylabel="Proportion",
-        ylim=(0, 1),
+    any_innovation_attempt_df = any_innovation_attempt_df.assign(
+        normalized_gain=(any_innovation_attempt_df["prestige_gain"] / reference_gain)
     )
-    sns.despine(ax=axs[0], left=True, bottom=True)
+    mean_scores = final_score_df.groupby("normalized_gain")["score"].mean()
+    peak_gain = mean_scores.idxmax()
 
     sns.lineplot(
         final_score_df,
-        x="prestige_gain",
+        x="normalized_gain",
         y="score",
         marker="o",
         color="black",
         err_style="bars",
-        ax=axs[1],
+        ax=ax,
+        linewidth=2.5,
+    )
+    ax.axvline(
+        peak_gain,
+        color="black",
+        linestyle="--",
+        linewidth=1.2,
+        alpha=0.45,
+        zorder=0,
+    )
+    sns.lineplot(
+        innovator_frequency_df,
+        x="normalized_gain",
+        y="innovator_frequency",
+        marker="s",
+        color="xkcd:red",
+        err_style="bars",
+        ax=ax,
         linewidth=2.0,
+        alpha=0.5,
     )
-    axs[1].axvline(peak_gain, color="black", linestyle="--", linewidth=1, alpha=0.6)
-    axs[1].set(
-        title=panel_titles[1] if show_column_titles else None,
-        xlabel="prestige gain" if show_xlabels else None,
+    if show_any_innovation_attempt:
+        sns.lineplot(
+            any_innovation_attempt_df,
+            x="normalized_gain",
+            y="any_innovation_probability",
+            marker="^",
+            color="xkcd:pink",
+            err_style="bars",
+            ax=ax,
+            linewidth=2.0,
+            alpha=0.5,
+        )
+
+    normalized_gains = gains / reference_gain
+    gain_span = normalized_gains.max() - normalized_gains.min()
+    gain_margin = 0.05 * gain_span if gain_span > 0 else 0.1
+    ax.set(
+        title=config.title if show_title else None,
+        xlabel=r"Normalised prestige gain ($g/g_{0.5}$)" if show_xlabel else None,
         ylabel=None,
+        xlim=(
+            normalized_gains.min() - gain_margin,
+            normalized_gains.max() + gain_margin,
+        ),
+        ylim=(-0.05, 1.05),
     )
-    sns.despine(ax=axs[1], left=True, bottom=True)
+    shared_y_ticks = np.linspace(0, 1, 6)
+    ax.set_yticks(shared_y_ticks)
+    ax.tick_params(axis="y", length=0)
+    if not show_yticks:
+        ax.tick_params(axis="y", labelleft=False)
 
-    axs[2].stackplot(
-        role_split_df["prestige_gain"],
-        role_split_df["innovate"],
-        role_split_df["imitate"],
-        labels=["innovate", "imitate"],
-        colors=["xkcd:burnt orange", "xkcd:salmon"],
-        alpha=1.0,
-    )
-    axs[2].set(
-        title=panel_titles[2] if show_column_titles else None,
-        xlabel="prestige gain" if show_xlabels else None,
-        ylabel=None,
-        xlim=(gains.min(), gains.max()),
-    )
-    axs[2].grid(False)
-    sns.despine(ax=axs[2], left=True, bottom=True)
+    sns.despine(ax=ax, left=True, bottom=True)
+    return reference_gain
 
 
-def plot_environment_summary(config):
-    fig, axs = plt.subplots(1, 3, figsize=(13.5, 3.5), sharey=True)
-    fig.suptitle(config.title, y=1.03, fontsize=13, fontweight="bold")
-    plot_environment_row(config, axs, show_column_titles=True, show_xlabels=True)
-    fig.tight_layout()
-    return fig
-
-
-def plot_all_environment_summaries(configs):
+def plot_all_environment_summaries():
+    variants = {"intrinsic": "Intrinsic motivation", "gift": "Deference gifting"}
+    reference_gain_rows = []
     fig, axs = plt.subplots(
-        len(configs),
-        3,
-        figsize=(12, 8),
-        sharey=True,
+        len(variants),
+        len(ENVIRONMENTS),
+        figsize=(13, 6),
         squeeze=False,
     )
 
-    for row_idx, config in enumerate(configs):
-        plot_environment_row(
-            config,
-            axs[row_idx],
-            show_column_titles=row_idx == 0,
-            show_xlabels=row_idx == len(configs) - 1,
+    for row_idx, variant in enumerate(list(variants.keys())):
+        for col_idx, env_config in enumerate(ENVIRONMENTS):
+            config_dict = env_config.__dict__.copy()
+            config_dict["data_dir"] = get_data_path(env_config, variant)
+            config = EnvironmentConfig(**config_dict)
+            reference_gain = plot_environment_panel(
+                config,
+                axs[row_idx, col_idx],
+                show_title=row_idx == 0,
+                show_xlabel=row_idx == len(variants) - 1,
+                show_yticks=col_idx == 0,
+            )
+            reference_gain_rows.append(
+                {
+                    "environment": env_config.name,
+                    "environment_title": env_config.title,
+                    "variant": variant,
+                    "target_innovator_frequency": TARGET_INNOVATOR_FREQUENCY,
+                    "reference_prestige_gain": reference_gain,
+                }
+            )
+
+        axs[row_idx, 0].text(
+            -0.1,
+            0.5,
+            variants[variant],
+            transform=axs[row_idx, 0].transAxes,
+            rotation=90,
+            va="center",
+            ha="right",
+            fontsize=13,
+            fontweight="medium",
         )
 
-    return fig
-
-
-def plot_innovation_decay_panel(config, ax, show_ylabel=False):
-    outputs = load_environment_outputs(config, {config.role_source})
-    innov_prob_ts = get_zero_p_innovate_ts(outputs, config)
-    t = np.arange(innov_prob_ts.shape[1])
-
-    for seed_series in innov_prob_ts:
-        ax.plot(t, seed_series, color="lightgray", alpha=0.7, linewidth=1)
-
-    ax.plot(t, innov_prob_ts.mean(axis=0), color="black", linewidth=1.5)
-    ax.set(
-        title=config.title,
-        xlabel="$t$",
-        ylabel="Probability" if show_ylabel else None,
-        xlim=(-5, 205),
-        ylim=(0, 0.65),
+    legend_handles = [
+        Line2D(
+            [0],
+            [0],
+            color="black",
+            marker="o",
+            linewidth=2,
+            label="Final average payoff (normalised)",
+        ),
+        Line2D(
+            [0],
+            [0],
+            color="xkcd:red",
+            alpha=0.5,
+            marker="s",
+            linewidth=2,
+            label="Innovator frequency (mean over all timesteps)",
+        ),
+    ]
+    fig.legend(
+        handles=legend_handles,
+        loc="upper center",
+        ncol=3,
+        frameon=False,
+        bbox_to_anchor=(0.5, 1.05),
     )
-    sns.despine(ax=ax, left=True, bottom=True)
-
-
-def plot_all_innovation_decay(configs):
-    fig, axs = plt.subplots(1, len(configs), figsize=(12, 3), sharey=True)
-    fig.suptitle(
-        "Initial probability of attempting innovation under zero prestige gain",
-        y=1.05,
-        fontsize=13,
-        fontweight="bold",
-    )
-
-    for col_idx, config in enumerate(configs):
-        plot_innovation_decay_panel(config, axs[col_idx], show_ylabel=col_idx == 0)
-
-    fig.tight_layout()
-    return fig
+    return fig, pd.DataFrame(reference_gain_rows)
 
 
 def main():
-    if len(sys.argv) == 1:
-        print(
-            "Please specify the 'intrinsic' or 'gift' variant as a command-line argument."
-        )
-        return
-
-    variant = sys.argv[1]
-    if variant not in {"intrinsic", "gift"}:
-        print(f"Invalid variant {variant!r}. Must be 'intrinsic' or 'gift'.")
-        return
-
-    configs = []
-    for env_config in ENVIRONMENTS:
-        config_dict = env_config.__dict__.copy()
-        config_dict["data_dir"] = get_data_path(env_config, variant)
-        configs.append(EnvironmentConfig(**config_dict))
-
-    fig = plot_all_environment_summaries(configs)
-    save_fig(fig, f"experiment_1_combined_{variant}")
-    fig = plot_all_innovation_decay(configs)
-    save_fig(fig, f"experiment_1_innovation_decay_combined_{variant}")
+    fig, reference_gain_df = plot_all_environment_summaries()
+    REFERENCE_GAINS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    reference_gain_df.to_csv(REFERENCE_GAINS_PATH, index=False)
+    save_fig(fig, "experiment_1_combined")
 
 
 if __name__ == "__main__":

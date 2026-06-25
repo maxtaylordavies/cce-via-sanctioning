@@ -945,12 +945,12 @@ def run_simulation_loop(
     )
 
 
-seeds = [0]
+seeds = list(range(5))
 grid_length, T_main, T_extra = 10, int(1e4), 200
 T = (
     T_main + T_extra
 )  # total timesteps to run (including extra for averaging agent metrics at the end)
-prestige_gain_vals = 10 * jnp.linspace(0.0, 1.0, 21)
+prestige_gain_vals = 10 * jnp.linspace(0.0, 1.0, 30)
 prestige_decay = 0.01
 prestige_value = 1.0
 

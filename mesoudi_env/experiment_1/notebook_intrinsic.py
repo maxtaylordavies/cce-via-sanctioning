@@ -84,7 +84,7 @@ def run_simulation_loop(
     p_i=1.0,
     p_c=1.0,
     b=0.2,
-    innov_cost=0.2,
+    innov_cost=0.1,
     p_d=0.001,
     init_q=1.0,
     choice_beta=0.1,
@@ -169,6 +169,7 @@ def run_simulation_loop(
             most_traits_known,
             total_unique_traits_known,
             role_probs.mean(axis=0),
+            all_roles,
             n_innovated.sum(),
             n_imitated.sum(),
             new_all_prestiges.mean(),
@@ -185,15 +186,15 @@ def run_simulation_loop(
 
     _, metrics = jax.lax.scan(body_fn, carry, jnp.arange(T))
     metrics = list(metrics)
-    metrics[4] = jnp.cumsum(metrics[4])  # cumulative number innovated
-    metrics[5] = jnp.cumsum(metrics[5])  # cumulative number imitated
+    metrics[5] = jnp.cumsum(metrics[5])  # cumulative number innovated
+    metrics[6] = jnp.cumsum(metrics[6])  # cumulative number imitated
     return metrics
 
 
 def main():
-    seeds = list(range(5))
+    seeds = list(range(10))
     grid_length, T = 10, int(4e3)
-    prestige_gain_vals = 2 * jnp.linspace(0.0, 1.0, 21)
+    prestige_gain_vals = 10 * jnp.linspace(0.0, 1.0, 30)
     prestige_decay = 0.01
     prestige_value = 1.0
 
@@ -213,6 +214,7 @@ def main():
     all_most_traits = []
     all_total_unique_traits = []
     all_role_probs = []
+    all_agent_roles = []
     all_n_innovated = []
     all_n_imitated = []
     all_mean_prestige = []
@@ -225,6 +227,7 @@ def main():
             most_traits,
             total_unique_traits,
             role_probs,
+            agent_roles,
             n_innov,
             n_imit,
             mean_prestige,
@@ -235,6 +238,7 @@ def main():
         all_most_traits.append(np.asarray(most_traits))
         all_total_unique_traits.append(np.asarray(total_unique_traits))
         all_role_probs.append(np.asarray(role_probs))
+        all_agent_roles.append(np.asarray(agent_roles))
         all_n_innovated.append(np.asarray(n_innov))
         all_n_imitated.append(np.asarray(n_imit))
         all_mean_prestige.append(np.asarray(mean_prestige))
@@ -254,6 +258,7 @@ def main():
         "most_traits": np.stack(all_most_traits, axis=0),
         "total_unique_traits": np.stack(all_total_unique_traits, axis=0),
         "role_probs": np.stack(all_role_probs, axis=0),
+        "agent_roles": np.stack(all_agent_roles, axis=0),
         "n_innovated": np.stack(all_n_innovated, axis=0),
         "n_imitated": np.stack(all_n_imitated, axis=0),
         "mean_prestige": np.stack(all_mean_prestige, axis=0),
