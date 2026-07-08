@@ -5,6 +5,7 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
+    "black>=26.5.1",
     "jax>=0.9.1",
     "numpy>=2.0.0",
     "seaborn>=0.13.2",

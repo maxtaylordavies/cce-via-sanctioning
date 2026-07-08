@@ -1,13 +1,12 @@
 from itertools import product
 
-import jax
+import jax.numpy as jnp
 import numpy as np
-import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
-from mpl_toolkits.axes_grid1.inset_locator import inset_axes
 
 from src.utils import save_fig
+from utils import progression_rate, compute_rate_optimal_eta, get_eta_star_fn
 
 sns.set_style("whitegrid")
 
@@ -15,166 +14,14 @@ N = 100
 beta = 1.0
 
 
-def time_to_discovery(eta, p_success):
-    p_fail = 1 - p_success
-    p_no_successes = p_fail ** (N * eta)
-    return 1 / (1 - p_no_successes + 1e-10)
-
-
-def time_to_diffusion(eta, phi):
-    eta_term = 1 / ((beta * (1 - eta)) + 1e-10)
-    phi_term = (phi * (N - 1)) / (1 - phi)
-    return eta_term * np.log(phi_term)
-
-
-def progression_rate(eta, p_success, phi):
-    rate = 1 / (time_to_discovery(eta, p_success) + time_to_diffusion(eta, phi))
-    return np.where(eta == 0, 0.0, rate)
-
-
-def compute_rate_optimal_eta(p_success, phi):
-    etas = np.linspace(0.0, 1.0, 1000)
-    rates = progression_rate(etas, p_success, phi)
-    return etas[np.argmax(rates)]
-
-
-def visualise_progression_rate_curves():
-    p_success_values = [0.01, 0.1, 0.5]
-    phi_values = [0.1, 0.3, 0.5, 0.7, 0.9]
-    eta_values = np.linspace(0.0, 1.0, 1000)
-
-    data = {"p_success": [], "phi": [], "eta": [], "progression_rate": []}
-    for p_success, phi in product(p_success_values, phi_values):
-        progression_rates = progression_rate(eta_values, p_success, phi)
-        data["p_success"].extend([p_success] * len(eta_values))
-        data["phi"].extend([phi] * len(eta_values))
-        data["eta"].extend(eta_values)
-        data["progression_rate"].extend(progression_rates)
-
-    df = pd.DataFrame(data)
-
-    palette = sns.color_palette("crest", n_colors=len(phi_values))
-    fig, axs = plt.subplots(
-        1,
-        len(p_success_values),
-        figsize=(16, 3.5),
-        sharey=True,
-        constrained_layout=True,
-    )
-    for i, p_success in enumerate(p_success_values):
-        sub_df = df[df["p_success"] == p_success]
-        sns.lineplot(
-            x="eta",
-            y="progression_rate",
-            hue="phi",
-            palette=palette,
-            data=sub_df,
-            ax=axs[i],
-            linewidth=2.0,
-            # legend=False,
-        )
-        axs[i].set_xlabel("Innovator frequency $\\eta$")
-        axs[i].set_ylabel("Cultural progression rate $G$")
-        axs[i].set_title(f"$p_\\text{{success}}={p_success}$")
-        sns.despine(ax=axs[i], left=True, bottom=True)
-
-        peak_rows = []
-        for phi_idx, phi in enumerate(phi_values):
-            subset = sub_df[sub_df["phi"] == phi]
-            max_idx = subset["progression_rate"].idxmax()
-            peak_rows.append(
-                {
-                    "phi": phi,
-                    "phi_idx": phi_idx,
-                    "eta": subset.loc[max_idx, "eta"],
-                    "progression_rate": subset.loc[max_idx, "progression_rate"],
-                }
-            )
-
-        peak_eta_values = np.array([row["eta"] for row in peak_rows])
-        peak_eta_range = peak_eta_values.max() - peak_eta_values.min()
-        peak_eta_margin = max(0.01, peak_eta_range * 0.6)
-        inset_eta_min = max(0, peak_eta_values.min() - peak_eta_margin)
-        inset_eta_max = min(1, peak_eta_values.max() + peak_eta_margin)
-        inset_df = sub_df[
-            (sub_df["eta"] >= inset_eta_min) & (sub_df["eta"] <= inset_eta_max)
-        ]
-        inset_y_min = inset_df["progression_rate"].min()
-        inset_y_max = inset_df["progression_rate"].max()
-        inset_y_pad = (inset_y_max - inset_y_min) * 0.08
-        inset_y_lower = inset_y_min - inset_y_pad
-        inset_y_upper = inset_y_max + inset_y_pad
-
-        axins = inset_axes(
-            axs[i],
-            width="38%",
-            height="38%",
-            loc="upper right",
-            borderpad=1.1,
-        )
-        axins.set_facecolor("white")
-
-        for row in peak_rows:
-            subset = sub_df[sub_df["phi"] == row["phi"]]
-            zoomed = subset[
-                (subset["eta"] >= inset_eta_min) & (subset["eta"] <= inset_eta_max)
-            ]
-            axins.plot(
-                zoomed["eta"],
-                zoomed["progression_rate"],
-                color=palette[row["phi_idx"]],
-                linewidth=1.0,
-                alpha=0.6,
-            )
-            axins.plot(
-                [row["eta"], row["eta"]],
-                [inset_y_lower, row["progression_rate"]],
-                color=palette[row["phi_idx"]],
-                linestyle="-",
-                linewidth=1.5,
-                alpha=1.0,
-            )
-            axins.plot(
-                row["eta"] * 0.998,
-                row["progression_rate"],
-                color="gold",
-                marker="*",
-                markersize=7,
-                markeredgecolor="black",
-                markeredgewidth=0.25,
-                linestyle="None",
-            )
-
-        axins.set_xlim(inset_eta_min, inset_eta_max)
-        axins.set_ylim(inset_y_lower, inset_y_upper)
-        axins.set_title("zoomed view of optimal $\\eta$ values", fontsize=8, pad=4)
-        axins.tick_params(axis="both", which="major", labelsize=7, length=2)
-        axins.tick_params(axis="y", labelleft=False)
-        for spine in axins.spines.values():
-            spine.set_visible(True)
-            spine.set_color("black")
-            spine.set_linewidth(0.8)
-
-    fig.suptitle(
-        "Cultural progression rate $G$ as a function of innovator frequency $\\eta$",
-        fontsize=12,
-    )
-
-    return fig
-
-
 def compute_y_lims_and_ticks(etas, eta_stars, global_eta_stars, Ds, eta_tick_size=0.1):
     # compute y-axis limits for eta
     eta_min = min(min(etas), min(eta_stars), min(global_eta_stars))
     eta_max = max(max(etas), max(eta_stars), max(global_eta_stars))
 
-    print(f"Raw eta limits: {eta_min:.3f}, {eta_max:.3f}")
-
     eta_min = np.floor(eta_min / eta_tick_size) * eta_tick_size
     eta_max = np.ceil(eta_max / eta_tick_size) * eta_tick_size
     num_ticks = np.ceil((eta_max - eta_min) / eta_tick_size).astype(int) + 1
-
-    print(f"Adjusted eta limits: {eta_min:.3f}, {eta_max:.3f} with {num_ticks} ticks")
 
     # find matching y-axis limits for D
     D_tick_size = np.ceil((max(Ds) - min(Ds)) / (num_ticks - 1))
@@ -255,6 +102,22 @@ def plot_segmented_line(
         )
 
 
+def get_step_fn(eta_star_fn, learning_rate=0.1, turnover_rate=0.001, pi_0=0.5, phi=0.1):
+    def step_fn(current_eta, D):
+        eta_star, _, p_success = eta_star_fn(D)
+        global_eta_star = compute_rate_optimal_eta(p_success, phi)
+        next_eta = (
+            current_eta
+            + (learning_rate * (eta_star - current_eta))
+            + (turnover_rate * (pi_0 - current_eta))
+        )
+        G = progression_rate(current_eta, p_success, phi)
+        next_D = D + G
+        return next_D, next_eta, eta_star, global_eta_star
+
+    return step_fn
+
+
 def make_single_learning_plot(
     ax,
     p_success_fn,
@@ -263,23 +126,22 @@ def make_single_learning_plot(
     phi=0.1,
     T=100,
     learning_rate=0.1,
+    turnover_rate=0.001,
+    pi_0=0.5,
 ):
     b_imit_fn = lambda D: D
-    v_innov_fn = lambda D: D
+    v_innov_fn = lambda D: 2 * D
+    c_imit_fn = lambda D: c_imit
 
-    def eta_star_fn(D):
-        delta_r = (
-            b_imit_fn(D) - c_imit - (p_success_fn(D) * v_innov_fn(D)) + c_innov_fn(D)
-        )
-        return 1 / (1 + np.exp(delta_r / beta))
+    eta_star_fn = get_eta_star_fn(
+        v_innov_fn, b_imit_fn, p_success_fn, c_innov_fn, c_imit_fn, beta=beta
+    )
 
-    def next_eta_fn(current_eta, eta_star):
-        return current_eta + learning_rate * (eta_star - current_eta)
+    step_fn = get_step_fn(eta_star_fn, learning_rate, turnover_rate, pi_0, phi)
 
-    D_0, eta_0 = 0.0, 0.0
-    p_0 = p_success_fn(D_0)
-    eta_star_0 = eta_star_fn(D_0)
-    global_eta_star_0 = compute_rate_optimal_eta(p_0, phi)
+    D_0, eta_0 = 0.0, pi_0
+    eta_star_0, _, p_success_0 = eta_star_fn(D_0)
+    global_eta_star_0 = compute_rate_optimal_eta(p_success_0, phi)
 
     Ds, etas, eta_stars, global_eta_stars = (
         [D_0],
@@ -288,12 +150,7 @@ def make_single_learning_plot(
         [global_eta_star_0],
     )
     for _ in range(T):
-        p = p_success_fn(Ds[-1])
-        eta_star = eta_star_fn(Ds[-1])
-        global_eta_star = compute_rate_optimal_eta(p, phi)
-        next_eta = next_eta_fn(etas[-1], eta_star)
-        G = progression_rate(etas[-1], p, phi)
-        next_D = Ds[-1] + G
+        next_D, next_eta, eta_star, global_eta_star = step_fn(etas[-1], Ds[-1])
         Ds.append(next_D)
         etas.append(next_eta)
         eta_stars.append(eta_star)
@@ -340,7 +197,7 @@ def make_single_learning_plot(
         ts[::dot_stride],
         global_eta_stars[::dot_stride],
         label="$\\arg\\max_{\\eta} G(\\eta)$",
-        color="gold",
+        color="xkcd:lime green",
         marker="o",
         markersize=3.4,
         markeredgewidth=0,
@@ -385,7 +242,7 @@ def make_single_learning_plot(
     return axs, (eta_lims, D_lims, eta_ticks, D_ticks)
 
 
-def make_learning_plots(V, c_imit, phi, learning_rate):
+def make_learning_plots(c_imit, phi, learning_rate):
     p_success_fns = {
         "$p_{success}(D) = 0.5$": lambda D: 0.5,
         "$p_{success}(D) = \\exp(-D)$": lambda D: np.exp(-D),
@@ -430,21 +287,11 @@ def make_learning_plots(V, c_imit, phi, learning_rate):
 
 
 def main():
-    rate_curves_fig = visualise_progression_rate_curves()
-    save_fig(
-        rate_curves_fig,
-        "progression_rate_curves",
-        subfolder="theoretical",
-        fmts=["png"],
-    )
-
-    V = 1.0
     c_imit = 0
     learning_rate = 0.1
 
     for phi in [0.1, 0.5, 0.9]:
         fig = make_learning_plots(
-            V=V,
             c_imit=c_imit,
             phi=phi,
             learning_rate=learning_rate,
