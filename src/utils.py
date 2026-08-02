@@ -1,4 +1,6 @@
 import os
+
+import jax
 import numpy as np
 import matplotlib.pyplot as plt
 
@@ -64,7 +66,7 @@ def concatenate_with_common_axis1(values, key):
     return np.concatenate(trimmed_values, axis=0)
 
 
-def save_fig(fig, name, subfolder=None, fmts=["png", "eps"], tight=True):
+def save_fig(fig, name, subfolder=None, fmts=["png"], tight=True):
     folder = "figures"
     if subfolder is not None:
         folder = f"{folder}/{subfolder}"
@@ -79,3 +81,7 @@ def save_fig(fig, name, subfolder=None, fmts=["png", "eps"], tight=True):
         fig.savefig(f"{folder}/{name}.{fmt}", bbox_inches="tight", dpi=300)
 
     plt.close(fig)
+
+
+def jax_key_to_np_rng(key):
+    return np.random.default_rng(np.asarray(jax.random.key_data(key)))

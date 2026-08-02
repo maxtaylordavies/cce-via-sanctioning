@@ -1,7 +1,6 @@
 N = 100
 phi = 0.1
 turnover_rate = 0.01
-preservation_rate = 1 / N
 baseline_value_fn = lambda D: D
 c_innov_fn = lambda D: 0.0
 c_imit_fn = lambda D: 0.0
