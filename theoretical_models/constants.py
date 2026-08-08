@@ -1,0 +1,9 @@
+N = 100
+phi = 0.1
+turnover_rate = 0.01
+baseline_value_fn = lambda D: D
+c_innov_fn = lambda D: 0.0
+c_imit_fn = lambda D: 0.0
+beta = 1.0
+learning_rate = 1.0
+pi_0 = 0.5
