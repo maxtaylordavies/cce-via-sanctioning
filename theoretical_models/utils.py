@@ -8,7 +8,6 @@ from matplotlib.offsetbox import (
     DrawingArea,
     HPacker,
     TextArea,
-    VPacker,
 )
 
 
@@ -131,14 +130,14 @@ def add_title_with_legend(
     legend_row = HPacker(
         children=[open_bracket, entries_box], align="center", pad=0, sep=4
     )
-    title_with_legend = VPacker(
-        children=[title_box, legend_row], align="center", pad=0, sep=3
+    title_with_legend = HPacker(
+        children=[title_box, legend_row], align="center", pad=0, sep=16
     )
     fig.add_artist(
         AnchoredOffsetbox(
-            loc="lower center",
+            loc="lower left",
             child=title_with_legend,
-            bbox_to_anchor=(0.5, 1.02),
+            bbox_to_anchor=(0.045, 1.02),
             bbox_transform=fig.transFigure,
             frameon=False,
             borderpad=0,

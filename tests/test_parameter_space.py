@@ -147,7 +147,7 @@ class AdaptiveCeilingTests(unittest.TestCase):
             bool(jnp.all((systems["pi_0"] > 0.0) & (systems["pi_0"] < 0.5)))
         )
 
-    def test_global_summary_and_stacked_barplot(self):
+    def test_global_summary_and_grouped_barplot(self):
         key = jax.random.key(7)
         systems = parameter_space.sample_systems_latin_hypercube(key, n_samples=3)
         proportions, _ = parameter_space.compute_system_outcomes(systems, N=10)
@@ -160,67 +160,84 @@ class AdaptiveCeilingTests(unittest.TestCase):
         self.assertAlmostEqual(success_proportions[-1], proportions[1])
 
         rows = []
-        for N in (10, 100, 1000):
-            for run_type, lambda_val in (
-                ("baseline", 0.0),
-                ("best_fixed", 0.25),
-                ("adaptive", -1.0),
-            ):
-                rows.append(
-                    {
-                        "N": N,
-                        "run_type": run_type,
-                        "lambda": lambda_val,
-                        "prop_0": 0.1,
-                        "prop_1": 0.4,
-                        "prop_success_1": 0.1,
-                        "prop_success_5": 0.3,
-                        "prop_success_10": 0.4,
-                        "prop_2": 0.2,
-                        "prop_3": 0.3,
-                        "prop_4": 0.0,
-                    }
-                )
+        for run_type, lambda_val in (
+            ("baseline", 0.0),
+            ("best_fixed", 0.25),
+            ("best_per_system_fixed", float("nan")),
+            ("adaptive", -1.0),
+        ):
+            rows.append(
+                {
+                    "N": 100,
+                    "run_type": run_type,
+                    "lambda": lambda_val,
+                    "prop_0": 0.1,
+                    "prop_1": 0.4,
+                    "prop_success_1": 0.1,
+                    "prop_success_5": 0.3,
+                    "prop_success_10": 0.4,
+                    "prop_2": 0.2,
+                    "prop_3": 0.3,
+                    "prop_4": 0.0,
+                }
+            )
 
-        fig = parameter_space.do_stacked_barplot(parameter_space.pd.DataFrame(rows))
+        fig = parameter_space.do_grouped_barplot(parameter_space.pd.DataFrame(rows))
         ax = fig.axes[0]
-        self.assertEqual(len(ax.patches), 63)
+        self.assertEqual(len(ax.patches), 24)
         self.assertIsNone(ax.get_legend())
-        first_outcome_bars = ax.patches[:9]
-        self.assertAlmostEqual(first_outcome_bars[0].get_width(), 1.0)
+        self.assertAlmostEqual(ax.patches[0].get_width(), 1.0)
         self.assertAlmostEqual(
-            first_outcome_bars[1].get_x() - first_outcome_bars[0].get_x() - 1.0,
+            ax.patches[12].get_x() - ax.patches[0].get_x() - 1.0,
             0.15,
         )
         self.assertAlmostEqual(
-            first_outcome_bars[3].get_x() - first_outcome_bars[2].get_x() - 1.0,
-            0.5,
+            ax.patches[1].get_x() - ax.patches[0].get_x() - 4.45,
+            0.75,
         )
         self.assertAlmostEqual(ax.patches[0].get_height(), 0.1)
-        self.assertAlmostEqual(ax.patches[9].get_height(), 0.2)
-        self.assertAlmostEqual(ax.patches[18].get_height(), 0.1)
+        self.assertAlmostEqual(ax.patches[4].get_height(), 0.2)
+        self.assertAlmostEqual(ax.patches[8].get_height(), 0.1)
         success_colour_brightness = [
-            sum(ax.patches[segment_idx * 9].get_facecolor()[:3])
+            sum(ax.patches[segment_idx * 4].get_facecolor()[:3])
             for segment_idx in range(3)
         ]
         self.assertEqual(success_colour_brightness, sorted(success_colour_brightness))
         self.assertEqual(
             [tick.get_text() for tick in ax.get_xticklabels()],
             [
-                "None\n[$\\lambda=0$]",
-                "Best fixed\n[$\\lambda=0.25$]",
-                "Adaptive\n[$\\lambda=\\lambda^*(D)$]",
+                "Success",
+                "Under-\ninnovation",
+                "Over-\ninnovation",
+                "No eq.\nfound",
             ]
-            * 3,
+            * 4,
         )
+        self.assertEqual(ax.get_xlabel(), "Outcome type")
+        self.assertEqual(list(ax.get_yticks()), [i / 10 for i in range(11)])
+        self.assertFalse(any(line.get_visible() for line in ax.get_ygridlines()))
+        self.assertEqual(len(ax.child_axes), 1)
+        norm_axis = ax.child_axes[0]
         self.assertEqual(
-            [text.get_text() for text in ax.texts],
-            ["Population size $M=10$", "$M=100$", "$M=1000$"],
+            [tick.get_text() for tick in norm_axis.get_xticklabels()],
+            [
+                "None\n[$\\lambda=0$]",
+                "Best fixed\n[$\\lambda=0.250$]",
+                "Per-system\nbest fixed\n[$\\lambda=\\lambda_i^*$]",
+                "Adaptive\n[$\\lambda=\\lambda^*(D)$]",
+            ],
         )
-        self.assertEqual(ax.get_xlabel(), "Value-capture norm")
-        self.assertEqual(list(ax.get_yticks()), [0.2, 0.4, 0.6, 0.8])
-        self.assertTrue(all(line.get_visible() for line in ax.get_ygridlines()))
-        self.assertEqual(len(ax.child_axes), 0)
+        self.assertEqual(norm_axis.get_xlabel(), "Value-capture norm")
+        parameter_space.plt.close(fig)
+
+        rows[0]["prop_0"] = 0.0
+        fig = parameter_space.do_grouped_barplot(parameter_space.pd.DataFrame(rows))
+        ax = fig.axes[0]
+        self.assertEqual(len(ax.patches), 23)
+        self.assertEqual(
+            [tick.get_text() for tick in ax.get_xticklabels()].count("No eq.\nfound"),
+            3,
+        )
         parameter_space.plt.close(fig)
 
     def test_find_optimal_fixed_lambda_for_systems(self):
@@ -246,6 +263,24 @@ class AdaptiveCeilingTests(unittest.TestCase):
                     self.assertAlmostEqual(optimal_lambda, peak, delta=3e-4)
                     self.assertAlmostEqual(outcomes["evaluated_at"], optimal_lambda)
                     self.assertAlmostEqual(float(score), 1.0, delta=1e-6)
+
+    def test_find_optimal_fixed_lambdas_per_system(self):
+        systems = parameter_space.sample_systems_latin_hypercube(
+            jax.random.key(17), n_samples=3, exclude_names=("w",)
+        )
+        baseline_props, baseline_score = parameter_space.compute_system_outcomes(
+            systems, N=10
+        )
+        optimal_lambdas, optimal_props, optimal_score = (
+            parameter_space.find_optimal_fixed_lambdas_per_system(systems, N=10)
+        )
+
+        self.assertEqual(optimal_lambdas.shape, (3,))
+        self.assertTrue(
+            bool(jnp.all((optimal_lambdas >= 0.0) & (optimal_lambdas <= 1.0)))
+        )
+        self.assertAlmostEqual(sum(optimal_props[label] for label in range(5)), 1.0)
+        self.assertGreaterEqual(float(optimal_score), float(baseline_score) - 1e-6)
 
 
 if __name__ == "__main__":

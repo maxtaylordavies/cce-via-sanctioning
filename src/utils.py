@@ -3,6 +3,7 @@ import os
 import jax
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib.colors import to_rgb
 
 
 def load_matching_outputs(data_dir, prefix):
@@ -85,3 +86,10 @@ def save_fig(fig, name, subfolder=None, fmts=["png"], tight=True):
 
 def jax_key_to_np_rng(key):
     return np.random.default_rng(np.asarray(jax.random.key_data(key)))
+
+
+def colour_midpoint(colour_a, colour_b):
+    return tuple(
+        (channel_a + channel_b) / 2
+        for channel_a, channel_b in zip(to_rgb(colour_a), to_rgb(colour_b))
+    )

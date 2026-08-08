@@ -24,7 +24,7 @@ from constants import *
 Ds = jnp.linspace(0.0, 80, 1000)
 etas = jnp.linspace(0.0, 1.0, 1000)
 
-p_success_fn_params = [(0.95, 0), (0.05, 0), (0.95, 0.1), (0.05, 0.1)]
+p_success_fn_params = [(1.0, 0), (0.1, 0), (1.0, 0.1), (0.1, 0.1)]
 fixed_lambdas = jnp.array([0.0, 0.1, 0.3, 0.5])
 
 # set up some colormaps for plotting
@@ -67,8 +67,8 @@ def compute_growth_optimal_eta(D, p_success, mu=turnover_rate, alpha=0.01, N=N):
 
 
 def compute_K(eta, N=N):
-    K = 1 + ((1 - eta) * (N - 1))
-    # K = phi * N
+    # K = 1 + ((1 - eta) * (N - 1))
+    K = phi * N
     return K
 
 
@@ -466,6 +466,33 @@ def do_plots_without_trajectories():
         dD_fn, _, _ = get_delta_functions(p_success_fn)
         net_change_grid = plot_phase_diagram(axs[i], dD_fn, Ds, etas, sign_only=False)
 
+        inset_ax = axs[i].inset_axes([0.63, 0.66, 0.31, 0.27])
+        inset_ax.plot(
+            np.asarray(Ds),
+            np.asarray(p_success_fn(Ds)),
+            color="black",
+            linewidth=1.5,
+        )
+        inset_ax.set(
+            xlim=(float(Ds[0]), float(Ds[-1])),
+            ylim=(0.0, 1.0),
+            xticks=(float(Ds[0]), float(Ds[-1])),
+            yticks=(0.0, 1.0),
+            xlabel="$D$",
+            ylabel="$p_\\mathrm{success}(D)$",
+        )
+        inset_ax.set_facecolor("white")
+        inset_ax.tick_params(axis="both", labelsize=7, length=2, pad=1)
+        inset_ax.xaxis.label.set_size(8)
+        inset_ax.yaxis.label.set_size(8)
+        inset_ax.xaxis.labelpad = 0
+        inset_ax.yaxis.labelpad = 0
+        inset_ax.grid(False)
+        for spine in inset_ax.spines.values():
+            spine.set_color("#555555")
+            spine.set_linewidth(0.7)
+        inset_ax.set_in_layout(False)
+
         ylabel = "Innovator frequency $\\eta_t$" if i == 0 else None
         x_lims, y_lims = compute_plot_lims(Ds, etas)
         axs[i].set(
@@ -517,7 +544,9 @@ def do_plots_without_trajectories():
 
     fig.suptitle(
         "Net rate of cultural change $\\frac{dD_t}{dt}$ as a function of cultural complexity $D_t$ and innovator frequency $\\eta_t$, for different $p_\\text{success}(D) = p_0e^{-kD}$",
-        fontsize=14,
+        x=0.04,
+        horizontalalignment="left",
+        fontsize=15,
     )
 
     return fig
@@ -578,7 +607,7 @@ def do_plots_for_w_vals(w_vals, colors):
         fig,
         "Visualising population equilibria under different learning-turnover balances $w \\in [0, 1]$ (learning dominates turnover as $w \\to 1$)",
         "w",
-        [f"{w:.1f}" for w in w_vals],
+        [f"{w:.1g}" for w in w_vals],
         colors,
     )
 
@@ -587,7 +616,7 @@ def do_plots_for_w_vals(w_vals, colors):
 
 def do_plots_for_c_vals(c_vals, colors):
     n_panels = len(p_success_fn_params)
-    fig, axs = plt.subplots(1, n_panels, figsize=(5 * n_panels, 5), sharey=True)
+    fig, axs = plt.subplots(1, n_panels, figsize=(4 * n_panels, 4), sharey=True)
 
     for i, (p0, k) in enumerate(p_success_fn_params):
         p_success_fn = get_p_success_fn(p0, k)
@@ -638,9 +667,9 @@ def do_plots_for_c_vals(c_vals, colors):
 
     add_title_with_legend(
         fig,
-        "Visualising RL-induced population equilibria under different innovation costs $c_\\text{innov}(D) = cD$",
+        "A. Example RL-induced population trajectories under different cost disparities $c_\\text{innov}(D) - c_\\text{imit}(D) = cD$",
         "c",
-        [f"{c:.2f}" for c in c_vals],
+        [f"{c:.1g}" for c in c_vals],
         colors,
     )
 
@@ -723,19 +752,19 @@ def do_plots_for_lambda_fns(all_lambda_fns, colors, styles=None, widths=None):
 def main():
     # do plots with no trajectories (phase diagrams only)
     fig = do_plots_without_trajectories()
-    save_fig(fig, "no_trajs", subfolder="theoretical/phase_diagrams")
+    save_fig(fig, "phase-diagrams", subfolder="new")
 
-    # do plots for just lambda=0 (baseline case) with different learning rates
-    w_vals = [0.0, 0.5, 0.9, 1.0]
-    w_colours = get_palette(len(w_vals))
-    fig = do_plots_for_w_vals(w_vals, w_colours)
-    save_fig(fig, "w_vals", subfolder="theoretical/phase_diagrams")
+    # # do plots for just lambda=0 (baseline case) with different learning rates
+    # w_vals = [0.0, 0.5, 0.9, 1.0]
+    # w_colours = get_palette(len(w_vals))
+    # fig = do_plots_for_w_vals(w_vals, w_colours)
+    # save_fig(fig, "w_vals", subfolder="theoretical/phase_diagrams")
 
-    # do plots for just lambda=0 (baseline case) with different innovation costs
-    c_vals = [0.0, 0.01, 0.1, 1.0]
-    c_colours = get_palette(len(c_vals))
-    fig = do_plots_for_c_vals(c_vals, c_colours)
-    save_fig(fig, "c_vals", subfolder="theoretical/phase_diagrams")
+    # # do plots for just lambda=0 (baseline case) with different innovation costs
+    # c_vals = [0.0, 0.01, 0.1, 1.0]
+    # c_colours = get_palette(len(c_vals))
+    # fig = do_plots_for_c_vals(c_vals, c_colours)
+    # save_fig(fig, "c_vals", subfolder="new")
 
     # # do plots for fixed lambda values
     # fixed_lambda_fns = [
@@ -750,12 +779,8 @@ def main():
     #     [lambda D: 0.0, get_optimal_lambda_fn(p_success_fn)]
     #     for p_success_fn, _ in p_success_fns.values()
     # ]
-    # fig = do_plots_for_lambda_fns(
-    #     variable_lambda_fns, variable_lambda_colors
-    # )
-    # save_fig(
-    #     fig, "optimal_lambda", subfolder="theoretical/phase_diagrams"
-    # )
+    # fig = do_plots_for_lambda_fns(variable_lambda_fns, variable_lambda_colors)
+    # save_fig(fig, "optimal_lambda", subfolder="theoretical/phase_diagrams")
 
     # # combined
     # combined_lambda_fns = [
