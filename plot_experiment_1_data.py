@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -12,8 +12,31 @@ from src.utils import save_fig
 sns.set_context("paper", font_scale=1.2)
 sns.set_style("whitegrid")
 
-TARGET_INNOVATOR_FREQUENCY = 0.5
-REFERENCE_GAINS_PATH = Path("figures/experiment_1_reference_gains.csv")
+DEFAULT_DATA_ROOT = Path("data")
+
+
+@dataclass(frozen=True)
+class ParameterSpec:
+    key: str
+    column: str
+    xlabel: str
+
+
+PARAMETER_SPECS = {
+    "value_capture_rates": ParameterSpec(
+        key="value_capture_rates",
+        column="value_capture_rate",
+        xlabel=r"Value-capture rate ($\lambda$)",
+    ),
+    # These aliases make the loader tolerant of likely names used by the later
+    # environment ports.
+    "lambdas": ParameterSpec(
+        key="lambdas",
+        column="value_capture_rate",
+        xlabel=r"Value-capture rate ($\lambda$)",
+    ),
+}
+PARAMETER_KEYS = set(PARAMETER_SPECS)
 
 
 @dataclass(frozen=True)
@@ -23,7 +46,7 @@ class EnvironmentConfig:
     score_key: str
     score_normalizer: float | str
     final_window: int | str = 500
-    data_dir: Path = Path("data")
+    data_dir: Path = DEFAULT_DATA_ROOT
 
 
 ENVIRONMENTS = (
@@ -47,32 +70,55 @@ ENVIRONMENTS = (
         score_key="agent_yields",
         score_normalizer=10.0,
         final_window=100,
-        # final_window="T_extra",
     ),
 )
 
 
-def get_data_path(config, variant):
-    return Path(f"data/{config.name}/experiment_1/{variant}")
+def get_experiment_data_path(config, data_root=DEFAULT_DATA_ROOT):
+    return Path(data_root) / config.name / "experiment_1"
+
+
+def contains_npz_outputs(data_dir):
+    return Path(data_dir).is_dir() and any(Path(data_dir).glob("*.npz"))
+
+
+def discover_available_datasets(data_root=DEFAULT_DATA_ROOT):
+    """Return available datasets, preferring the new value-capture outputs.
+
+    A new single-version output may be placed directly in an environment's
+    ``experiment_1`` directory or in a ``value_capture`` subdirectory.  Once at
+    least one such dataset exists, legacy prestige datasets are omitted so that
+    old and new mechanisms are not mixed in the same figure.
+    """
+    value_capture_configs = []
+    for config in ENVIRONMENTS:
+        experiment_dir = get_experiment_data_path(config, data_root)
+
+        # check path exists
+        if Path(experiment_dir).exists():
+            value_capture_configs.append(replace(config, data_dir=experiment_dir))
+
+    return value_capture_configs
 
 
 def load_npz_outputs(data_dir, array_keys, metadata_keys=()):
     outputs = {}
     concat_buffers = {}
-    parameter_keys = {"fees", "prestige_gains"}
     array_keys = set(array_keys)
     metadata_keys = set(metadata_keys)
+    paths = sorted(Path(data_dir).glob("*.npz"))
+    if not paths:
+        raise FileNotFoundError(f"No .npz outputs found in {Path(data_dir)!s}.")
 
-    for path in sorted(data_dir.glob("*.npz")):
+    for path in paths:
         with np.load(path, allow_pickle=True) as file_outputs:
             for key in file_outputs.files:
                 if key not in array_keys and key not in (
-                    parameter_keys | metadata_keys
+                    PARAMETER_KEYS | metadata_keys
                 ):
                     continue
 
                 value = file_outputs[key]
-
                 if value.shape == ():
                     if key not in outputs:
                         outputs[key] = value
@@ -82,7 +128,7 @@ def load_npz_outputs(data_dir, array_keys, metadata_keys=()):
                         )
                     continue
 
-                if key in parameter_keys:
+                if key in PARAMETER_KEYS:
                     if key not in outputs:
                         outputs[key] = value
                     elif not np.array_equal(outputs[key], value):
@@ -95,7 +141,6 @@ def load_npz_outputs(data_dir, array_keys, metadata_keys=()):
 
     for key, values in concat_buffers.items():
         outputs[key] = np.concatenate(values, axis=0)
-
     return outputs
 
 
@@ -108,9 +153,14 @@ def get_scalar(outputs, key, default=None):
     return value
 
 
-def get_prestige_gains(outputs):
-    key = "prestige_gains" if "prestige_gains" in outputs else "fees"
-    return np.asarray(outputs[key], dtype=np.float64)
+def get_parameter_values(outputs):
+    for key, spec in PARAMETER_SPECS.items():
+        if key in outputs:
+            return np.asarray(outputs[key], dtype=np.float64), spec
+    raise KeyError(
+        "No supported experiment parameter found. Expected one of "
+        f"{sorted(PARAMETER_KEYS)}."
+    )
 
 
 def load_environment_outputs(config, array_keys):
@@ -119,13 +169,11 @@ def load_environment_outputs(config, array_keys):
         metadata_keys.add(config.score_normalizer)
     if isinstance(config.final_window, str):
         metadata_keys.add(config.final_window)
-
     return load_npz_outputs(config.data_dir, array_keys, metadata_keys)
 
 
 def get_agent_roles(outputs):
     roles = np.asarray(outputs["agent_roles"])
-
     role_innovate = int(get_scalar(outputs, "role_innovate"))
     role_imitate = int(get_scalar(outputs, "role_imitate"))
     min_role = min(role_innovate, role_imitate)
@@ -133,16 +181,14 @@ def get_agent_roles(outputs):
 
     if roles.ndim != 4:
         raise ValueError(
-            "Expected agent_roles to have shape (seed, prestige_gain, time, agent), "
+            "Expected agent_roles to have shape (seed, parameter, time, agent), "
             f"but got {roles.shape}."
         )
-
-    if roles.min() < min_role or roles.max() > max_role:
+    if roles.size and (roles.min() < min_role or roles.max() > max_role):
         raise ValueError(
             "agent_roles contains values outside the saved role codes: "
             f"expected values between {min_role} and {max_role}."
         )
-
     return roles
 
 
@@ -163,105 +209,58 @@ def get_final_window(outputs, config):
     return int(config.final_window)
 
 
-def get_innovator_frequency_df(outputs, config, gains):
+def get_innovator_frequency_df(
+    outputs, parameter_values, parameter_column, final_window
+):
     role_innovate = int(get_scalar(outputs, "role_innovate"))
     roles = get_agent_roles(outputs)
-    innovate = (roles == role_innovate).mean(axis=(2, 3))
+    innovate = (roles == role_innovate)[:, :, -final_window:].mean(axis=(2, 3))
 
     rows = []
     for seed_idx in range(innovate.shape[0]):
-        for gain_idx, gain in enumerate(gains):
+        for parameter_idx, parameter_value in enumerate(parameter_values):
             rows.append(
                 {
                     "seed": seed_idx,
-                    "prestige_gain": gain,
-                    "innovator_frequency": innovate[seed_idx, gain_idx],
+                    parameter_column: parameter_value,
+                    "innovator_frequency": innovate[seed_idx, parameter_idx],
                 }
             )
     return pd.DataFrame(rows)
 
 
-def get_any_innovation_attempt_df(outputs, config, gains):
-    role_innovate = int(get_scalar(outputs, "role_innovate"))
-    final_window = get_final_window(outputs, config)
-
-    roles = get_agent_roles(outputs)
-    any_innovation = (roles == role_innovate).any(axis=-1)
-    probabilities = any_innovation[:, :, -final_window:].mean(axis=2)
-
-    rows = []
-    for seed_idx in range(probabilities.shape[0]):
-        for gain_idx, gain in enumerate(gains):
-            rows.append(
-                {
-                    "seed": seed_idx,
-                    "prestige_gain": gain,
-                    "any_innovation_probability": probabilities[seed_idx, gain_idx],
-                }
-            )
-    return pd.DataFrame(rows)
-
-
-def get_final_score_df(score_ts, gains, final_window):
+def get_final_score_df(score_ts, parameter_values, parameter_column, final_window):
     final_scores = score_ts[:, :, -final_window:].mean(axis=2)
     rows = []
     for seed_idx in range(final_scores.shape[0]):
-        for gain_idx, gain in enumerate(gains):
+        for parameter_idx, parameter_value in enumerate(parameter_values):
             rows.append(
                 {
                     "seed": seed_idx,
-                    "prestige_gain": gain,
-                    "score": final_scores[seed_idx, gain_idx],
+                    parameter_column: parameter_value,
+                    "score": final_scores[seed_idx, parameter_idx],
                 }
             )
     return pd.DataFrame(rows)
-
-
-def get_reference_prestige_gain(innovator_frequency_df):
-    mean_frequencies = (
-        innovator_frequency_df.groupby("prestige_gain")["innovator_frequency"]
-        .mean()
-        .sort_index()
-    )
-    gains = mean_frequencies.index.to_numpy(dtype=float)
-    frequencies = mean_frequencies.to_numpy(dtype=float)
-    crossing_idxs = np.flatnonzero(frequencies >= TARGET_INNOVATOR_FREQUENCY)
-
-    if crossing_idxs.size == 0:
-        raise ValueError(
-            f"Innovator frequency never reaches {TARGET_INNOVATOR_FREQUENCY}"
-        )
-
-    upper_idx = int(crossing_idxs[0])
-    if upper_idx == 0:
-        return gains[0]
-
-    lower_idx = upper_idx - 1
-    frequency_span = frequencies[upper_idx] - frequencies[lower_idx]
-    if np.isclose(frequency_span, 0):
-        return gains[upper_idx]
-
-    crossing_fraction = (
-        TARGET_INNOVATOR_FREQUENCY - frequencies[lower_idx]
-    ) / frequency_span
-    return gains[lower_idx] + crossing_fraction * (gains[upper_idx] - gains[lower_idx])
 
 
 def get_environment_summary_data(config):
     outputs = load_environment_outputs(config, {config.score_key, "agent_roles"})
-    gains = get_prestige_gains(outputs)
+    parameter_values, parameter_spec = get_parameter_values(outputs)
     score_ts = get_score_ts(outputs, config)
     final_window = get_final_window(outputs, config)
 
-    final_score_df = get_final_score_df(score_ts, gains, final_window)
-    innovator_frequency_df = get_innovator_frequency_df(outputs, config, gains)
-    any_innovation_attempt_df = get_any_innovation_attempt_df(outputs, config, gains)
-
+    final_score_df = get_final_score_df(
+        score_ts, parameter_values, parameter_spec.column, final_window
+    )
+    innovator_frequency_df = get_innovator_frequency_df(
+        outputs, parameter_values, parameter_spec.column, final_window
+    )
     return (
-        gains,
+        parameter_values,
+        parameter_spec,
         final_score_df,
         innovator_frequency_df,
-        any_innovation_attempt_df,
     )
 
 
@@ -271,30 +270,21 @@ def plot_environment_panel(
     show_title=False,
     show_xlabel=False,
     show_yticks=False,
-    show_any_innovation_attempt=False,
 ):
     (
-        gains,
+        _,
+        parameter_spec,
         final_score_df,
         innovator_frequency_df,
-        any_innovation_attempt_df,
     ) = get_environment_summary_data(config)
-    reference_gain = get_reference_prestige_gain(innovator_frequency_df)
-    final_score_df = final_score_df.assign(
-        normalized_gain=final_score_df["prestige_gain"] / reference_gain
-    )
-    innovator_frequency_df = innovator_frequency_df.assign(
-        normalized_gain=innovator_frequency_df["prestige_gain"] / reference_gain
-    )
-    any_innovation_attempt_df = any_innovation_attempt_df.assign(
-        normalized_gain=(any_innovation_attempt_df["prestige_gain"] / reference_gain)
-    )
-    mean_scores = final_score_df.groupby("normalized_gain")["score"].mean()
-    peak_gain = mean_scores.idxmax()
 
+    plot_column = parameter_spec.column
+
+    mean_scores = final_score_df.groupby(plot_column)["score"].mean()
+    peak_parameter = mean_scores.idxmax()
     sns.lineplot(
         final_score_df,
-        x="normalized_gain",
+        x=plot_column,
         y="score",
         marker="o",
         color="black",
@@ -303,7 +293,7 @@ def plot_environment_panel(
         linewidth=2.5,
     )
     ax.axvline(
-        peak_gain,
+        peak_parameter,
         color="black",
         linestyle="--",
         linewidth=1.2,
@@ -312,7 +302,7 @@ def plot_environment_panel(
     )
     sns.lineplot(
         innovator_frequency_df,
-        x="normalized_gain",
+        x=plot_column,
         y="innovator_frequency",
         marker="s",
         color="xkcd:red",
@@ -321,84 +311,53 @@ def plot_environment_panel(
         linewidth=2.0,
         alpha=0.5,
     )
-    if show_any_innovation_attempt:
-        sns.lineplot(
-            any_innovation_attempt_df,
-            x="normalized_gain",
-            y="any_innovation_probability",
-            marker="^",
-            color="xkcd:pink",
-            err_style="bars",
-            ax=ax,
-            linewidth=2.0,
-            alpha=0.5,
-        )
 
-    normalized_gains = gains / reference_gain
-    gain_span = normalized_gains.max() - normalized_gains.min()
-    gain_margin = 0.05 * gain_span if gain_span > 0 else 0.1
+    plotted_parameters = np.asarray(
+        final_score_df[plot_column].drop_duplicates(), dtype=float
+    )
+    parameter_span = plotted_parameters.max() - plotted_parameters.min()
+    parameter_margin = 0.05 * parameter_span if parameter_span > 0 else 0.1
     ax.set(
         title=config.title if show_title else None,
-        xlabel=r"Normalised prestige gain ($g/g_{0.5}$)" if show_xlabel else None,
+        xlabel=parameter_spec.xlabel if show_xlabel else None,
         ylabel=None,
         xlim=(
-            normalized_gains.min() - gain_margin,
-            normalized_gains.max() + gain_margin,
+            plotted_parameters.min() - parameter_margin,
+            plotted_parameters.max() + parameter_margin,
         ),
         ylim=(-0.05, 1.05),
+        # ylim=(0.7, 0.8),
     )
-    shared_y_ticks = np.linspace(0, 1, 6)
-    ax.set_yticks(shared_y_ticks)
+    # ax.set_yticks(np.linspace(0, 1, 6))
     ax.tick_params(axis="y", length=0)
     if not show_yticks:
         ax.tick_params(axis="y", labelleft=False)
-
     sns.despine(ax=ax, left=True, bottom=True)
-    return reference_gain
 
 
-def plot_all_environment_summaries():
-    variants = {"intrinsic": "Intrinsic motivation", "gift": "Deference gifting"}
-    reference_gain_rows = []
+def plot_all_environment_summaries(data_root=DEFAULT_DATA_ROOT):
     fig, axs = plt.subplots(
-        len(variants),
+        1,
         len(ENVIRONMENTS),
-        figsize=(13, 6),
-        squeeze=False,
+        figsize=(4 * len(ENVIRONMENTS), 3.5),
     )
 
-    for row_idx, variant in enumerate(list(variants.keys())):
-        for col_idx, env_config in enumerate(ENVIRONMENTS):
-            config_dict = env_config.__dict__.copy()
-            config_dict["data_dir"] = get_data_path(env_config, variant)
-            config = EnvironmentConfig(**config_dict)
-            reference_gain = plot_environment_panel(
-                config,
-                axs[row_idx, col_idx],
-                show_title=row_idx == 0,
-                show_xlabel=row_idx == len(variants) - 1,
-                show_yticks=col_idx == 0,
-            )
-            reference_gain_rows.append(
-                {
-                    "environment": env_config.name,
-                    "environment_title": env_config.title,
-                    "variant": variant,
-                    "target_innovator_frequency": TARGET_INNOVATOR_FREQUENCY,
-                    "reference_prestige_gain": reference_gain,
-                }
-            )
+    configs = discover_available_datasets(data_root)
+    configs_by_name = {config.name: config for config in configs}
 
-        axs[row_idx, 0].text(
-            -0.1,
-            0.5,
-            variants[variant],
-            transform=axs[row_idx, 0].transAxes,
-            rotation=90,
-            va="center",
-            ha="right",
-            fontsize=13,
-            fontweight="medium",
+    for col_idx, environment in enumerate(ENVIRONMENTS):
+        config = configs_by_name.get(environment.name)
+
+        if config is None:
+            axs[col_idx].set_visible(False)
+            continue
+
+        plot_environment_panel(
+            config,
+            axs[col_idx],
+            show_title=True,
+            show_xlabel=True,
+            show_yticks=col_idx == 0,
         )
 
     legend_handles = [
@@ -408,7 +367,7 @@ def plot_all_environment_summaries():
             color="black",
             marker="o",
             linewidth=2,
-            label="Final average payoff (normalised)",
+            label="Final cultural performance (normalised)",
         ),
         Line2D(
             [0],
@@ -417,24 +376,23 @@ def plot_all_environment_summaries():
             alpha=0.5,
             marker="s",
             linewidth=2,
-            label="Innovator frequency (mean over all timesteps)",
+            label="Final innovator frequency",
         ),
     ]
     fig.legend(
         handles=legend_handles,
         loc="upper center",
-        ncol=3,
+        ncol=2,
         frameon=False,
-        bbox_to_anchor=(0.5, 1.05),
+        bbox_to_anchor=(0.5, 1.02),
     )
-    return fig, pd.DataFrame(reference_gain_rows)
+    fig.tight_layout(rect=(0, 0, 1, 0.92))
+    return fig
 
 
 def main():
-    fig, reference_gain_df = plot_all_environment_summaries()
-    REFERENCE_GAINS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    reference_gain_df.to_csv(REFERENCE_GAINS_PATH, index=False)
-    save_fig(fig, "experiment_1_combined")
+    fig = plot_all_environment_summaries()
+    save_fig(fig, "experiment_1_combined", tight=False)
 
 
 if __name__ == "__main__":
