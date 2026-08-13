@@ -44,7 +44,6 @@ class EnvironmentConfig:
     name: str
     title: str
     score_key: str
-    score_normalizer: float | str
     final_window: int | str = 500
     data_dir: Path = DEFAULT_DATA_ROOT
 
@@ -54,21 +53,24 @@ ENVIRONMENTS = (
         name="mesoudi_env",
         title="Binary trait environment",
         score_key="mean_traits",
-        score_normalizer="max_total_l",
         final_window=1000,
     ),
     EnvironmentConfig(
         name="miu_env",
         title="Refinement bandit environment",
         score_key="payoffs",
-        score_normalizer=1.0,
         final_window=100,
     ),
+    # EnvironmentConfig(
+    #     name="recipe_world_env",
+    #     title="Recipe grammar environment",
+    #     score_key="agent_yields",
+    #     final_window=250,
+    # ),
     EnvironmentConfig(
-        name="recipe_world_env",
-        title="Recipe grammar environment",
-        score_key="agent_yields",
-        score_normalizer=10.0,
+        name="tech_tree_env",
+        title="Compositional tech-tree environment",
+        score_key="agent_scores",
         final_window=100,
     ),
 )
@@ -94,8 +96,7 @@ def discover_available_datasets(data_root=DEFAULT_DATA_ROOT):
     for config in ENVIRONMENTS:
         experiment_dir = get_experiment_data_path(config, data_root)
 
-        # check path exists
-        if Path(experiment_dir).exists():
+        if contains_npz_outputs(experiment_dir):
             value_capture_configs.append(replace(config, data_dir=experiment_dir))
 
     return value_capture_configs
@@ -164,9 +165,13 @@ def get_parameter_values(outputs):
 
 
 def load_environment_outputs(config, array_keys):
-    metadata_keys = {"T", "grid_length", "role_innovate", "role_imitate"}
-    if isinstance(config.score_normalizer, str):
-        metadata_keys.add(config.score_normalizer)
+    metadata_keys = {
+        "T",
+        "grid_length",
+        "role_innovate",
+        "role_imitate",
+        "max_portfolio_score",
+    }
     if isinstance(config.final_window, str):
         metadata_keys.add(config.final_window)
     return load_npz_outputs(config.data_dir, array_keys, metadata_keys)
@@ -194,13 +199,9 @@ def get_agent_roles(outputs):
 
 def get_score_ts(outputs, config):
     score = np.asarray(outputs[config.score_key])
-    if config.score_key == "agent_yields":
-        score = score.mean(axis=-1, dtype=np.float64)
-
-    normalizer = config.score_normalizer
-    if isinstance(normalizer, str):
-        normalizer = float(get_scalar(outputs, normalizer, 1.0))
-    return score / float(normalizer)
+    if config.score_key in {"agent_yields", "agent_scores"}:
+        score = np.median(score, axis=-1)
+    return score
 
 
 def get_final_window(outputs, config):
@@ -231,6 +232,18 @@ def get_innovator_frequency_df(
 
 def get_final_score_df(score_ts, parameter_values, parameter_column, final_window):
     final_scores = score_ts[:, :, -final_window:].mean(axis=2)
+    # Normalise to the highest observed across-seed mean on the plotted lambda
+    # grid. This preserves seed variation while making the plotted mean curve
+    # peak at one, rather than scaling it against an often distant theoretical
+    # ceiling.
+    achieved_max = np.nanmax(final_scores.mean(axis=0))
+    if not np.isfinite(achieved_max) or achieved_max <= 0:
+        raise ValueError(
+            "Cannot normalise final scores: the maximum achieved mean score "
+            f"must be positive and finite, but got {achieved_max}."
+        )
+    final_scores = final_scores / achieved_max
+
     rows = []
     for seed_idx in range(final_scores.shape[0]):
         for parameter_idx, parameter_value in enumerate(parameter_values):
@@ -339,7 +352,7 @@ def plot_all_environment_summaries(data_root=DEFAULT_DATA_ROOT):
     fig, axs = plt.subplots(
         1,
         len(ENVIRONMENTS),
-        figsize=(4 * len(ENVIRONMENTS), 3.5),
+        figsize=(4 * len(ENVIRONMENTS), 3),
     )
 
     configs = discover_available_datasets(data_root)
@@ -367,7 +380,7 @@ def plot_all_environment_summaries(data_root=DEFAULT_DATA_ROOT):
             color="black",
             marker="o",
             linewidth=2,
-            label="Final cultural performance (normalised)",
+            label="Final cultural complexity $D$ (normalised)",
         ),
         Line2D(
             [0],
@@ -386,7 +399,9 @@ def plot_all_environment_summaries(data_root=DEFAULT_DATA_ROOT):
         frameon=False,
         bbox_to_anchor=(0.5, 1.02),
     )
-    fig.tight_layout(rect=(0, 0, 1, 0.92))
+    # fig.suptitle(
+    #     "A. Effect of fixed value-capture rate in three simulation environments",
+    # )
     return fig
 
 

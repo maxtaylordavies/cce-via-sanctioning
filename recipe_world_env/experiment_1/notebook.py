@@ -1,10 +1,12 @@
 """Experiment 1: value capture in the recipe-grammar environment.
 
-Successful imitation is valued by the copied recipe's marginal contribution to
-the imitator's library on a fixed, level-stratified reference panel.  The
+Successful imitation is valued by the copied recipe's improvement over the
+recipe it replaces, measured on a fixed, level-stratified reference panel. The
 imitator retains ``1 - value_capture_rate`` of that value and the creator of the
-exact copied recipe receives the remainder.  If that creator has died, the
-imitator still pays but the captured value leaves the system.
+exact copied recipe receives the remainder. If that creator has died, the
+imitator still pays but the captured value leaves the system. New recipes are
+prototypes: a second agent must independently copy one before it becomes usable
+for foraging.
 """
 
 from functools import partial
@@ -16,7 +18,7 @@ from tqdm import tqdm
 
 MAX_ENERGY = 500
 ROLE_INNOVATE, ROLE_IMITATE = 0, 1
-CHOICE_BETA = 0.1
+CHOICE_BETA = 0.02
 NUM_RULES_IN_INITIAL_LIBRARY = 3
 
 # --- 1. Vocabulary ---
@@ -30,13 +32,10 @@ REVERSE_RULES = {
     (N,): [[H, N, H]],  # wrap nutrient in husks
     (H,): [[H, H]],  # double the husk
     (H, H): [[S]],  # fuse adjacent husks into a hard shell
-    (S,): [[S, S]],  # add a husk or double the hard shell
-    (S, S, S): [
-        [S, T, S, T],
-        [P, S, S, P],
-    ],  # add spikes or toxins around/between triple shells
-    (T,): [[T, T]],  # double the toxin
-    (P,): [[P, P]],  # double the spike
+    (S,): [[S, S]],  # double the hard shell
+    (S, S, S): [[S, T, S, T], [P, S, S, P]],  # add toxins or spikes
+    (T,): [[T, T]],
+    (P,): [[P, P]],
 }
 
 # JIT-safe rule tables derived from REVERSE_RULES.
@@ -50,11 +49,12 @@ MAX_EXPANSION_LEN = max(
     ]
 )
 MAX_RULE_LEN = max(MAX_TARGET_LEN, MAX_EXPANSION_LEN)
-MAX_PLANT_LEN = 20
 MAX_COMPLEXITY_LEVEL = 10
+MAX_PLANT_LEN = 20
 MAX_RECIPE_LEN = MAX_COMPLEXITY_LEVEL + 10
 MAX_LIBRARY_SIZE = 10
 EMPTY_RECIPE_ID = -1
+MAX_PLANT_VALUE = 10.0
 
 GOAL_PLANT = jnp.zeros(MAX_PLANT_LEN, dtype=jnp.int32).at[0].set(N)
 
@@ -104,13 +104,7 @@ ATOMIC_REPLACEMENT_LENGTHS = jnp.sum(ATOMIC_REPLACEMENTS != PAD, axis=1).astype(
 PLANT_POSITIONS = jnp.arange(MAX_PLANT_LEN, dtype=jnp.int32)
 RULE_OFFSETS = jnp.arange(MAX_RULE_LEN, dtype=jnp.int32)
 
-OP_PROBS = jnp.array(
-    [
-        0.4,
-        0.4,
-        0.2,
-    ]
-)  # probabilities for add, delete, combine operations during innovation
+OP_PROBS = jnp.array([0.4, 0.4, 0.2])
 OP_THRESHOLDS = jnp.cumsum(OP_PROBS)
 
 
@@ -228,7 +222,8 @@ def pregenerate_plants(key, num_per_level, max_level):
 @partial(jax.jit, static_argnames=["n"])
 def sample_levels(key, energy, n):
     _energy = jnp.clip(energy, 0, MAX_ENERGY)
-    avg_level = (_energy / MAX_ENERGY) * MAX_COMPLEXITY_LEVEL
+    energy_fraction = _energy / MAX_ENERGY
+    avg_level = energy_fraction * MAX_COMPLEXITY_LEVEL
     lo = jnp.floor(avg_level)
     p = jnp.array([1 - (avg_level - lo), avg_level - lo])
     levels = jax.random.choice(key, jnp.array([lo, lo + 1]), p=p, shape=(n,))
@@ -296,11 +291,12 @@ def apply_recipe(plant, recipe):
 
 
 def plant_value(level):
-    return level
+    level_fraction = level / MAX_COMPLEXITY_LEVEL
+    return MAX_PLANT_VALUE * level_fraction
 
 
 def foraging_cost(level):
-    return level / 2
+    return plant_value(level) / 2
 
 
 @jax.jit
@@ -340,6 +336,20 @@ def evaluate_library(plants, levels, library, rule_cost=0.01):
     )  # best yield achieved for each plant across all recipes
     avg_yield = per_plant_max.mean()  # average of best yields across the batch
     return avg_yield, per_plant_max, best_recipe_idx
+
+
+@jax.jit
+def evaluate_active_library(
+    plants, levels, library, active_recipe_mask, rule_cost=0.01
+):
+    """Evaluate only recipes that have cleared the social-validation stage."""
+    scores = jax.vmap(
+        lambda recipe: evaluate_recipe(plants, levels, recipe, rule_cost)
+    )(library)
+    active_scores = jnp.where(active_recipe_mask[:, None], scores, 0.0)
+    best_recipe_idx = active_scores.mean(axis=1).argmax()
+    per_plant_max = active_scores.max(axis=0)
+    return per_plant_max.mean(), per_plant_max, best_recipe_idx
 
 
 @jax.jit
@@ -389,22 +399,6 @@ def get_diff_size(library_1, library_2):
 @jax.jit
 def get_num_recipes(library):
     return jnp.sum(jnp.any(library != PAD, axis=1))
-
-
-@jax.jit
-def get_library_entropy(library):
-    num_rules = atomic_rules.shape[0]
-    transitions_from = library[:, :-1].reshape(-1)
-    transitions_to = library[:, 1:].reshape(-1)
-    transition_counts = jnp.zeros((num_rules, num_rules), dtype=jnp.int32)
-    transition_counts = transition_counts.at[transitions_from, transitions_to].add(1)
-
-    # exclude the first row of transition_counts (corresponding to PAD)
-    transition_counts = transition_counts[1:]
-
-    p = transition_counts / transition_counts.sum(axis=1, keepdims=True)
-    p = jnp.nan_to_num(p)  # replace NaNs from zero rows with zeros
-    return -jnp.sum(p * jnp.log(p + 1e-10))
 
 
 @jax.jit
@@ -633,6 +627,9 @@ def run_simulation_loop(
     p_death=0.001,
     choice_beta=CHOICE_BETA,
     reference_value_rule="recipe_replacement",
+    imitation_acceptance_capture_weight=0.5,
+    require_social_validation=False,
+    prototype_reward_fraction=1.0,
 ):
     n_agents = grid_length**2
     max_recipe_ids = NUM_RULES_IN_INITIAL_LIBRARY + (T * n_agents)
@@ -671,7 +668,10 @@ def run_simulation_loop(
         level_key, plant_key = jax.random.split(key)
         levels = sample_levels(level_key, energy, n_forage)
         plant_idxs = jax.random.randint(
-            plant_key, shape=(n_forage,), minval=0, maxval=plants_per_level
+            plant_key,
+            shape=(n_forage,),
+            minval=0,
+            maxval=plants_per_level,
         )
         plants_ = plants[levels, plant_idxs]
         return plants_, levels
@@ -679,8 +679,13 @@ def run_simulation_loop(
     # (keys, energies) -> foraged_plants, levels
     vmapped_forage = jax.vmap(forage, in_axes=(0, 0))
 
-    # (foraged_plant, level, libraries) -> avg yields, per-plant max yields, best recipe indices
+    # Evaluate active recipes for harvest, while allowing imitators to observe
+    # promising prototypes when selecting a demonstrator.
     vmapped_eval_library = jax.vmap(evaluate_library, in_axes=(0, 0, 0))
+    vmapped_eval_active_library = jax.vmap(
+        evaluate_active_library,
+        in_axes=(0, 0, 0, 0),
+    )
 
     @jax.jit
     def update_library(
@@ -696,6 +701,7 @@ def run_simulation_loop(
         best_recipe_idxs,
         recipe_ages,
         reference_scores,
+        active_recipe_mask,
     ):
         # ROLE KEY: 0 = innovate, 1 = imitate
         innov_key, adopt_key = jax.random.split(key)
@@ -704,7 +710,11 @@ def run_simulation_loop(
         plant_batch = foraged_plants[agent_idx]
         level_batch = foraged_levels[agent_idx]
         curr_yield = curr_yield_per_plant.mean()
-        curr_reference_scores = reference_scores[agent_idx]
+        curr_reference_scores = jnp.where(
+            active_recipe_mask[agent_idx, :, None],
+            reference_scores[agent_idx],
+            0.0,
+        )
 
         def compute_new_avg_yield(new_library, recipe_idx):
             new_plant_scores = evaluate_recipe(
@@ -808,11 +818,12 @@ def run_simulation_loop(
             do_imitate,
             operand=None,
         )
-        delta_size = get_diff_size(libraries[agent_idx], new_library)
-        innovation_cost = innov_cost * delta_size
+        innovation_cost = innov_cost * get_diff_size(libraries[agent_idx], new_library)
         chosen_role = roles[agent_idx]
+        innovating = chosen_role == ROLE_INNOVATE
+        imitating = chosen_role == ROLE_IMITATE
         action_cost = jnp.where(
-            chosen_role == ROLE_INNOVATE,
+            innovating,
             innovation_cost,
             0.0,
         )
@@ -821,12 +832,28 @@ def run_simulation_loop(
         # An agent who cannot afford the chosen action leaves their library
         # unchanged and pays no role-specific cost.
         yield_delta = new_yield - curr_yield
-        p_accept = get_acceptance_prob(yield_delta)
+        expected_capture_paid = jnp.where(
+            imitating & (copied_recipe_id >= NUM_RULES_IN_INITIAL_LIBRARY),
+            value_capture_rate * reference_value,
+            0.0,
+        )
+        acceptance_delta = (
+            yield_delta - imitation_acceptance_capture_weight * expected_capture_paid
+        )
+        p_accept = get_acceptance_prob(acceptance_delta)
         accept = jax.random.bernoulli(adopt_key, p_accept) & can_afford_action
 
         new_library = jnp.where(accept, new_library, libraries[agent_idx])
         yield_delta = jnp.where(accept, yield_delta, 0.0)
-        reference_value = jnp.where(accept, reference_value, 0.0)
+        # A prototype can be privately assessed by its creator, but it has no
+        # immediate production value until another agent independently copies
+        # it.  A small option value can still reward exploratory effort.
+        action_reference_value = jnp.where(
+            innovating & require_social_validation,
+            prototype_reward_fraction * reference_value,
+            reference_value,
+        )
+        action_reference_value = jnp.where(accept, action_reference_value, 0.0)
         new_reference_scores = (
             reference_scores[agent_idx].at[new_idx].set(new_reference_recipe_scores)
         )
@@ -842,7 +869,7 @@ def run_simulation_loop(
         return (
             new_library,
             yield_delta,
-            delta_size,
+            innovation_cost,
             new_ages,
             accept,
             can_afford_action,
@@ -851,13 +878,27 @@ def run_simulation_loop(
             parent_1_id,
             parent_2_id,
             new_reference_scores,
-            reference_value,
+            action_reference_value,
         )
 
     # Each action updates at most one library slot and its cached reference score.
     vmapped_update_library = jax.vmap(
         update_library,
-        in_axes=(0, 0, 0, None, None, None, None, None, None, None, None, None),
+        in_axes=(
+            0,
+            0,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ),
     )
 
     def body_fn(carry, t):
@@ -877,6 +918,7 @@ def run_simulation_loop(
             recipe_creator_agent_ids,
             recipe_birth_timesteps,
             reference_scores,
+            recipe_validated,
         ) = carry
 
         # get new keys
@@ -907,12 +949,27 @@ def run_simulation_loop(
             initial_reference_scores,
             reference_scores,
         )
-
         # each agent forages a plant based on their current energy level
         foraged_plants, foraged_levels = vmapped_forage(forage_keys, energies)
 
-        # process each agent's foraged batch with their current library
-        avg_yields, per_plant_yields, best_recipe_idxs = vmapped_eval_library(
+        # Recipes created by innovation begin as prototypes.  They become
+        # productive only after an independent imitation validates the recipe.
+        safe_recipe_ids = jnp.where(recipe_ids >= 0, recipe_ids, 0)
+        socially_validated = recipe_validated[safe_recipe_ids]
+        extant_recipes = jnp.any(libraries != PAD, axis=2)
+        active_recipe_masks = extant_recipes & jnp.where(
+            require_social_validation,
+            (recipe_ids < NUM_RULES_IN_INITIAL_LIBRARY) | socially_validated,
+            jnp.ones_like(socially_validated),
+        )
+
+        # Process each agent's foraged batch using productive recipes only.
+        avg_yields, per_plant_yields, _ = vmapped_eval_active_library(
+            foraged_plants, foraged_levels, libraries, active_recipe_masks
+        )
+        # Demonstrators can nevertheless expose their latest promising
+        # prototype to imitators, which is what enables social validation.
+        _, _, best_recipe_idxs = vmapped_eval_library(
             foraged_plants, foraged_levels, libraries
         )
 
@@ -924,7 +981,7 @@ def run_simulation_loop(
         (
             new_libraries,
             yield_deltas,
-            delta_sizes,
+            innovation_costs,
             new_recipe_ages,
             accepts,
             can_afford_actions,
@@ -947,6 +1004,7 @@ def run_simulation_loop(
             best_recipe_idxs,
             recipe_ages,
             reference_scores,
+            active_recipe_masks,
         )
 
         slot_mask = jnp.arange(MAX_LIBRARY_SIZE)[None, :] == update_idxs[:, None]
@@ -997,6 +1055,18 @@ def run_simulation_loop(
         )
         next_recipe_id = next_recipe_id + accepted_innovations_int.sum()
 
+        # An accepted copy is an independent replication of the demonstrator's
+        # recipe.  It validates that recipe globally; the creator's prototype
+        # and all existing copies can be used from the next timestep onward.
+        valid_copied_recipe_ids = jnp.where(
+            accepted_imitations & (copied_recipe_ids >= NUM_RULES_IN_INITIAL_LIBRARY),
+            copied_recipe_ids,
+            0,
+        )
+        recipe_validated = recipe_validated.at[valid_copied_recipe_ids].max(
+            accepted_imitations & (copied_recipe_ids >= NUM_RULES_IN_INITIAL_LIBRARY)
+        )
+
         (
             capture_paid,
             capture_income,
@@ -1015,10 +1085,11 @@ def run_simulation_loop(
         # compute costs and rewards
         role_costs = jnp.where(
             affordable_innovations,
-            innov_cost * delta_sizes,
+            innovation_costs,
             0.0,
         )
-        costs = foraging_cost(foraged_levels.mean(axis=1)) + role_costs
+        costs = foraging_cost(foraged_levels).mean(axis=1)
+        costs += role_costs
         costs += capture_paid
 
         # update each agent's energy
@@ -1026,10 +1097,9 @@ def run_simulation_loop(
         # energies = jnp.clip(energies + delta_energies, 0, MAX_ENERGY)
         energies = jnp.minimum(energies + delta_energies, MAX_ENERGY)
 
-        # update q-values based on reward prediction error
-        # Both roles learn from the same reference-panel definition of value.
-        # This gives innovators the self-use value of their own accepted
-        # creation, in addition to any capture income it later generates.
+        # Update role values from reference-panel gains. Prototype innovators
+        # receive only their configured option value; later capture income is
+        # separately credited to innovation by ``update_role_values``.
         action_benefits = reference_values
         rewards = compute_direct_rewards(
             action_benefits,
@@ -1078,6 +1148,7 @@ def run_simulation_loop(
             recipe_creator_agent_ids,
             recipe_birth_timesteps,
             new_reference_scores,
+            recipe_validated,
         ), (
             foraged_levels.mean(axis=-1),
             avg_yields,
@@ -1107,6 +1178,11 @@ def run_simulation_loop(
     )
     recipe_birth_timesteps = jnp.full(max_recipe_ids, -1, dtype=jnp.int32)
     reference_scores = jnp.tile(initial_reference_scores[None, ...], (n_agents, 1, 1))
+    recipe_validated = (
+        jnp.zeros(max_recipe_ids, dtype=jnp.bool_)
+        .at[:NUM_RULES_IN_INITIAL_LIBRARY]
+        .set(True)
+    )
 
     carry = (
         key,
@@ -1124,6 +1200,7 @@ def run_simulation_loop(
         recipe_creator_agent_ids,
         recipe_birth_timesteps,
         reference_scores,
+        recipe_validated,
     )
 
     carry, metrics = jax.lax.scan(body_fn, carry, jnp.arange(T))
@@ -1157,15 +1234,20 @@ def run_simulation_loop(
 
 def main():
     seeds = list(range(3))
-    grid_length, T_main, T_extra = 10, int(2e3), 200
+    grid_length, T_main, T_extra = 10, int(1e3), 100
     T = T_main + T_extra
-    value_capture_rates = jnp.linspace(0.0, 0.5, 20)
+    value_capture_rates = jnp.linspace(0.0, 1.0, 30)
     n_valuation_per_level = 25
-    innov_cost = 0.1
+    innov_cost = 0.01
     imit_dist_threshold = 1
     learning_rate = 0.1
-    p_death = 0.001
+    p_death = 0.0001
+    choice_beta = 0.02
+    n_innov_attempts = 3
     reference_value_rule = "recipe_replacement"
+    imitation_acceptance_capture_weight = 0.5
+    require_social_validation = True
+    prototype_reward_fraction = 0.1
 
     def run_with_value_capture_rate(key, plants, value_capture_rate):
         return jax.block_until_ready(
@@ -1177,11 +1259,18 @@ def main():
                 value_capture_rate,
                 final_phase=T_extra,
                 n_valuation_per_level=n_valuation_per_level,
+                n_innov_attempts=n_innov_attempts,
                 innov_cost=innov_cost,
                 imit_dist_threshold=imit_dist_threshold,
                 learning_rate=learning_rate,
                 p_death=p_death,
+                choice_beta=choice_beta,
                 reference_value_rule=reference_value_rule,
+                imitation_acceptance_capture_weight=(
+                    imitation_acceptance_capture_weight
+                ),
+                require_social_validation=require_social_validation,
+                prototype_reward_fraction=prototype_reward_fraction,
             )
         )
 
@@ -1226,7 +1315,7 @@ def main():
         "T_extra": np.int32(T_extra),
         "grid_length": np.int32(grid_length),
         "n_forage": np.int32(10),
-        "n_innov_attempts": np.int32(3),
+        "n_innov_attempts": np.int32(n_innov_attempts),
         "n_valuation_per_level": np.int32(n_valuation_per_level),
         "valuation_levels_min": np.int32(1),
         "valuation_levels_max": np.int32(MAX_COMPLEXITY_LEVEL),
@@ -1235,9 +1324,16 @@ def main():
         "imit_dist_threshold": np.int32(imit_dist_threshold),
         "learning_rate": np.float32(learning_rate),
         "p_death": np.float32(p_death),
+        "choice_beta": np.float32(choice_beta),
         "model_variant": np.asarray("value_capture"),
+        "max_plant_value": np.float32(MAX_PLANT_VALUE),
         "creator_attribution": np.asarray("exact_recipe_creator"),
         "imitation_value_rule": np.asarray(reference_value_rule),
+        "imitation_acceptance_capture_weight": np.float32(
+            imitation_acceptance_capture_weight
+        ),
+        "require_social_validation": np.asarray(require_social_validation),
+        "prototype_reward_fraction": np.float32(prototype_reward_fraction),
         "initial_recipes_capturable": np.asarray(False),
         "learning_rule": np.asarray(
             "chosen_role_plus_delayed_capture_income_to_innovate"
